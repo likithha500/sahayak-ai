@@ -50,6 +50,16 @@ self.addEventListener("fetch", (event) => {
 
   if (url.origin !== self.location.origin) return;
 
+  // Avoid stale Next.js bundles in local development while retaining
+  // the offline-page cache and all IndexedDB recordings.
+  if (
+    (self.location.hostname === "localhost" ||
+      self.location.hostname === "127.0.0.1") &&
+    url.pathname.startsWith("/_next/static/")
+  ) {
+    return;
+  }
+
   // Never cache API requests.
   if (url.pathname.startsWith("/api/")) return;
 

@@ -14,6 +14,7 @@ import {
   uploadPendingAudio,
   type OfflineAudioVisit,
 } from "@/src/services/offline-queue"
+import { notifyDataUpdated } from "@/src/services/api.service"
 
 import OfflineServiceWorker from "@/src/components/offline-service-worker"
 
@@ -51,6 +52,15 @@ function formatDuration(seconds: number): string {
 
 export default function OfflineAudioPage() {
   const [beneficiaryId, setBeneficiaryId] = useState("")
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const selectedId = params.get("beneficiaryId")
+
+    if (selectedId) {
+      setBeneficiaryId(selectedId)
+    }
+  }, [])
   const [visits, setVisits] = useState<OfflineAudioVisit[]>([])
   const [recording, setRecording] = useState(false)
   const [preview, setPreview] =
@@ -664,17 +674,47 @@ export default function OfflineAudioPage() {
 // SAVED AUDIO CARD
 // ==================================================
 
+
+type TranscriptJob = {
+  client_record_id: string
+  beneficiary_id: string
+  status: string
+  transcript: string | null
+  transcript_language: string | null
+  stt_model: string | null
+  reviewed_transcript: string | null
+  reviewed_at: string | null
+  confirmed_visit_id: number | null
+  visit_saved: boolean
+}
+
+type OfflineVisitDraft = {
+  beneficiary_id: string | null
+  beneficiary_name: string | null
+  visit_type: "pregnancy" | "newborn" | "child" | "postnatal" | "general" | null
+  weight_kg: number | null
+  vaccinations_due: string[] | null
+  next_visit_date: string | null
+}
+
 function SavedAudioCard({
   visit,
 }: {
   visit: OfflineAudioVisit
 }) {
-  const [audioUrl, setAudioUrl] =
-    useState<string | null>(null)
+  const [audioUrl, setAudioUrl] = useState<string | null>(null)
+  const [job, setJob] = useState<TranscriptJob | null>(null)
+  const [reviewedText, setReviewedText] = useState("")
+  const [visitDraft, setVisitDraft] = useState<OfflineVisitDraft | null>(null)
+  const [explicitlyConfirmed, setExplicitlyConfirmed] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState("")
+
+  const recordId = visit.clientRecordId
+  const baseUrl = `/api/offline-sync/audio/${encodeURIComponent(recordId)}`
 
   useEffect(() => {
     const objectUrl = URL.createObjectURL(visit.audio)
-
     setAudioUrl(objectUrl)
 
     return () => {
@@ -682,39 +722,195 @@ function SavedAudioCard({
     }
   }, [visit.audio])
 
+  const loadStatus = useCallback(async () => {
+    setBusy(true)
+    setError("")
+
+    try {
+      const response = await fetch(`${baseUrl}/processing`, {
+        cache: "no-store",
+      })
+      const result = await response.json()
+
+      if (!response.ok) {
+        throw new Error(
+          result.detail || result.error || "Unable to load transcript"
+        )
+      }
+
+      setJob(result)
+      setReviewedText(
+        result.reviewed_transcript ?? result.transcript ?? ""
+      )
+    } catch (cause) {
+      setError(
+        cause instanceof Error ? cause.message : "Request failed"
+      )
+    } finally {
+      setBusy(false)
+    }
+  }, [baseUrl])
+
+  useEffect(() => {
+    if (visit.status === "uploaded") {
+      void loadStatus()
+    }
+  }, [loadStatus, visit.status])
+
+  async function transcribe() {
+    setBusy(true)
+    setError("")
+
+    try {
+      const response = await fetch(`${baseUrl}/process`, {
+        method: "POST",
+      })
+      const result = await response.json()
+
+      if (!response.ok) {
+        throw new Error(
+          result.detail || result.error || "Transcription failed"
+        )
+      }
+
+      setJob(result)
+      setReviewedText(
+        result.reviewed_transcript ?? result.transcript ?? ""
+      )
+    } catch (cause) {
+      setError(
+        cause instanceof Error ? cause.message : "Request failed"
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function confirm() {
+    const text = reviewedText.trim()
+
+    if (!text) {
+      setError("Please review the transcript before confirming.")
+      return
+    }
+
+    setBusy(true)
+    setError("")
+
+    try {
+      const response = await fetch(`${baseUrl}/confirm`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          reviewed_transcript: text,
+        }),
+      })
+
+      const result = await response.json()
+
+      if (!response.ok) {
+        throw new Error(
+          result.detail || result.error || "Confirmation failed"
+        )
+      }
+
+      setJob(result)
+      setReviewedText(result.reviewed_transcript ?? text)
+      setVisitDraft(null)
+      setExplicitlyConfirmed(false)
+    } catch (cause) {
+      setError(
+        cause instanceof Error ? cause.message : "Request failed"
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function extractVisitDraft() {
+    setBusy(true)
+    setError("")
+    try {
+      const response = await fetch(`${baseUrl}/extract`, {
+        method: "POST",
+      })
+      const result = await response.json()
+      if (!response.ok) {
+        throw new Error(
+          result.detail || result.error || "Visit extraction failed"
+        )
+      }
+      setVisitDraft(result.visit as OfflineVisitDraft)
+      setExplicitlyConfirmed(false)
+    } catch (cause) {
+      setError(
+        cause instanceof Error ? cause.message : "Visit extraction failed"
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function saveConfirmedVisit() {
+    if (!visitDraft || !explicitlyConfirmed || !visitDraft.visit_type) {
+      setError("Select the visit type and explicitly confirm the reviewed draft.")
+      return
+    }
+    setBusy(true)
+    setError("")
+    try {
+      const response = await fetch(`${baseUrl}/confirm-visit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          confirmed: true,
+          visit: visitDraft,
+        }),
+      })
+      const result = await response.json()
+      if (!response.ok) {
+        throw new Error(
+          result.detail || result.error || "Visit could not be saved"
+        )
+      }
+      setJob(result)
+      notifyDataUpdated()
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Visit was not saved; the reviewed draft is preserved."
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <article className="rounded-xl border p-5">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-        <strong className="text-lg">
-          {visit.beneficiaryId}
-        </strong>
+        <strong className="text-lg">{visit.beneficiaryId}</strong>
 
-        {visit.status === "uploaded" ? (
-          <span className="rounded-full bg-green-100 px-3 py-1 text-sm font-medium text-green-800">
-            Uploaded — Awaiting Processing
-          </span>
-        ) : (
-          <span className="rounded-full bg-amber-100 px-3 py-1 text-sm font-medium text-amber-800">
-            Pending Sync
-          </span>
-        )}
+        <span className="rounded-full bg-blue-100 px-3 py-1 text-sm text-blue-800">
+          {job?.status ??
+            (visit.status === "uploaded"
+              ? "Uploaded"
+              : "Pending Sync")}
+        </span>
       </div>
 
       <p className="mb-2 text-sm text-gray-600">
-        Duration:{" "}
-        {formatDuration(visit.durationSeconds)}
+        Duration: {formatDuration(visit.durationSeconds)}
       </p>
 
       {audioUrl && (
-        <audio
-          controls
-          src={audioUrl}
-          className="mb-3 w-full"
-        />
+        <audio controls src={audioUrl} className="mb-3 w-full" />
       )}
 
       <p className="break-all text-xs text-gray-500">
-        Local Record ID: {visit.clientRecordId}
+        Local Record ID: {recordId}
       </p>
 
       {visit.serverSyncId !== undefined && (
@@ -724,10 +920,260 @@ function SavedAudioCard({
       )}
 
       <p className="mt-1 text-xs text-gray-500">
-        Recorded:{" "}
-        {new Date(visit.recordedAt).toLocaleString()}
+        Recorded: {new Date(visit.recordedAt).toLocaleString()}
       </p>
+
+      {visit.status === "uploaded" && (
+        <div className="mt-5 space-y-4 border-t pt-4">
+          <h3 className="font-semibold">Gnani Transcript Review</h3>
+
+          <div className="flex flex-wrap gap-3">
+            <button
+              type="button"
+              onClick={() => void loadStatus()}
+              disabled={busy}
+              className="rounded-lg border px-4 py-2 disabled:opacity-50"
+            >
+              Refresh Status
+            </button>
+
+            {(!job ||
+              job.status === "uploaded" ||
+              job.status === "failed") && (
+              <button
+                type="button"
+                onClick={() => void transcribe()}
+                disabled={busy}
+                className="rounded-lg bg-indigo-700 px-4 py-2 text-white disabled:opacity-50"
+              >
+                {busy ? "Working..." : "Transcribe with Gnani"}
+              </button>
+            )}
+          </div>
+
+          {job?.transcript && (
+            <div>
+              <p className="mb-2 text-sm font-medium">
+                Original Gnani Transcript
+              </p>
+              <p className="whitespace-pre-wrap rounded-lg bg-gray-100 p-3 text-sm text-gray-900">
+                {job.transcript}
+              </p>
+              <p className="mt-2 text-xs text-gray-500">
+                Language: {job.transcript_language ?? "Unknown"}
+                {" · "}
+                Model: {job.stt_model ?? "Unknown"}
+              </p>
+            </div>
+          )}
+
+          {job?.status === "awaiting_review" && (
+            <div className="space-y-3">
+              <label
+                htmlFor={`review-${recordId}`}
+                className="block font-medium"
+              >
+                Review and Correct Transcript
+              </label>
+
+              <textarea
+                id={`review-${recordId}`}
+                value={reviewedText}
+                onChange={(event) =>
+                  setReviewedText(event.target.value)
+                }
+                rows={5}
+                maxLength={10000}
+                className="w-full rounded-lg border p-3"
+              />
+
+              <button
+                type="button"
+                onClick={() => void confirm()}
+                disabled={busy || !reviewedText.trim()}
+                className="rounded-lg bg-green-700 px-5 py-3 font-medium text-white disabled:opacity-50"
+              >
+                Confirm Reviewed Transcript
+              </button>
+            </div>
+          )}
+
+          {job?.status === "confirmed" && (
+            <div className="space-y-4 rounded-lg border p-4">
+              <p className="font-semibold text-green-700">
+                Transcript reviewed. The visit has not been saved yet.
+              </p>
+
+              <p className="mt-2 whitespace-pre-wrap text-sm">
+                {job.reviewed_transcript}
+              </p>
+
+              {job.reviewed_at && (
+                <p className="mt-2 text-xs text-gray-500">
+                  Reviewed: {job.reviewed_at} UTC
+                </p>
+              )}
+
+              <button
+                type="button"
+                onClick={() => void extractVisitDraft()}
+                disabled={busy}
+                className="rounded-lg bg-indigo-700 px-4 py-2 text-white disabled:opacity-50"
+              >
+                {busy ? "Extracting..." : "Extract structured visit draft"}
+              </button>
+
+              {visitDraft && (
+                <div className="space-y-4 rounded-lg border bg-gray-50 p-4">
+                  <h4 className="font-semibold">Review structured visit</h4>
+                  <p className="text-sm text-gray-700">
+                    Registered beneficiary: {visitDraft.beneficiary_name || job.beneficiary_id}
+                    {" · "}{job.beneficiary_id}
+                  </p>
+
+                  <label className="block text-sm font-medium">
+                    Visit type
+                    <select
+                      value={visitDraft.visit_type || ""}
+                      onChange={(event) =>
+                        setVisitDraft((current) =>
+                          current
+                            ? {
+                                ...current,
+                                visit_type: event.target.value
+                                  ? event.target.value as OfflineVisitDraft["visit_type"]
+                                  : null,
+                              }
+                            : current
+                        )
+                      }
+                      className="mt-1 block w-full rounded-lg border bg-white p-3"
+                    >
+                      <option value="">Select visit type</option>
+                      <option value="pregnancy">Pregnancy</option>
+                      <option value="newborn">Newborn</option>
+                      <option value="child">Child</option>
+                      <option value="postnatal">Postnatal</option>
+                      <option value="general">General</option>
+                    </select>
+                  </label>
+
+                  <label className="block text-sm font-medium">
+                    Weight (kg)
+                    <input
+                      type="number"
+                      min="0"
+                      max="300"
+                      step="0.1"
+                      value={visitDraft.weight_kg ?? ""}
+                      onChange={(event) =>
+                        setVisitDraft((current) =>
+                          current
+                            ? {
+                                ...current,
+                                weight_kg: event.target.value
+                                  ? Number(event.target.value)
+                                  : null,
+                              }
+                            : current
+                        )
+                      }
+                      className="mt-1 block w-full rounded-lg border bg-white p-3"
+                    />
+                  </label>
+
+                  <label className="block text-sm font-medium">
+                    Vaccinations due (optional; comma-separated)
+                    <input
+                      value={visitDraft.vaccinations_due?.join(", ") || ""}
+                      onChange={(event) =>
+                        setVisitDraft((current) =>
+                          current
+                            ? {
+                                ...current,
+                                vaccinations_due: event.target.value.trim()
+                                  ? event.target.value
+                                      .split(",")
+                                      .map((item) => item.trim())
+                                      .filter(Boolean)
+                                  : null,
+                              }
+                            : current
+                        )
+                      }
+                      className="mt-1 block w-full rounded-lg border bg-white p-3"
+                    />
+                  </label>
+
+                  <label className="block text-sm font-medium">
+                    Next visit date (optional)
+                    <input
+                      type="date"
+                      value={visitDraft.next_visit_date || ""}
+                      onChange={(event) =>
+                        setVisitDraft((current) =>
+                          current
+                            ? {
+                                ...current,
+                                next_visit_date: event.target.value || null,
+                              }
+                            : current
+                        )
+                      }
+                      className="mt-1 block w-full rounded-lg border bg-white p-3"
+                    />
+                  </label>
+
+                  <label className="flex items-start gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={explicitlyConfirmed}
+                      onChange={(event) =>
+                        setExplicitlyConfirmed(event.target.checked)
+                      }
+                    />
+                    <span>I reviewed and explicitly confirm this visit draft for saving.</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => void saveConfirmedVisit()}
+                    disabled={busy || !explicitlyConfirmed || !visitDraft.visit_type}
+                    className="rounded-lg bg-green-700 px-5 py-3 font-medium text-white disabled:opacity-50"
+                  >
+                    {busy ? "Saving..." : "Confirm and save visit"}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {job?.status === "visit_saved" && (
+            <div className="rounded-lg border border-green-300 bg-green-50 p-4">
+              <p className="font-semibold text-green-700">
+                Visit saved successfully · Visit ID {job.confirmed_visit_id}
+              </p>
+            </div>
+          )}
+
+          {job?.status === "processing" && (
+            <p className="text-sm">
+              Transcription is processing. Refresh the status shortly.
+            </p>
+          )}
+
+          {job?.status === "failed" && (
+            <p className="text-sm text-red-700">
+              Transcription failed. You can retry.
+            </p>
+          )}
+
+          {error && (
+            <p role="alert" className="text-sm text-red-700">
+              {error}
+            </p>
+          )}
+        </div>
+      )}
     </article>
   )
 }
-

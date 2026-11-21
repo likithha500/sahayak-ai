@@ -2,7 +2,7 @@
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class VisitExtraction(BaseModel):
@@ -35,3 +35,23 @@ class ExtractResponse(BaseModel):
     visit: VisitExtraction
     status: Literal["draft"] = "draft"
     saved: Literal[False] = False
+
+
+class FollowUpUpdate(BaseModel):
+    scheduled_date: date | None = None
+    status: Literal["pending", "completed"] | None = None
+
+    @model_validator(mode="after")
+    def require_update(self):
+        if self.scheduled_date is None and self.status is None:
+            raise ValueError("Provide a new date or follow-up status")
+        return self
+
+
+class ReferralStatusUpdate(BaseModel):
+    status: Literal[
+        "not_started",
+        "referred",
+        "follow_up_pending",
+        "completed",
+    ]

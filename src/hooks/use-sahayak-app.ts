@@ -1,154 +1,234 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
-import { beneficiaries, scenarios, type Beneficiary, type Scenario } from '@/src/data/mock'
-import { mockVisitStore } from '@/src/services/mock.service'
-import { extractionService } from '@/src/services/extraction.service'
-import { safetyService } from '@/src/services/safety.service'
-import type { VisitRecord } from '@/src/types/visit'
+import { useCallback, useEffect, useState } from 'react'
 import type { Language } from '@/src/data/translations'
+import {
+  apiService,
+  subscribeToDataUpdates,
+  type Alert,
+  type Beneficiary,
+  type Dashboard,
+  type FollowUp,
+  type Visit,
+} from '@/src/services/api.service'
 
-export type AppPage = 'home' | 'people' | 'follow' | 'history' | 'profile' | 'voice' | 'record' | 'review' | 'saved'
-
-const visitTypeFor = (beneficiary: Beneficiary) => beneficiary.category === 'Pregnant' ? 'Pregnancy visit' : 'Newborn visit'
+export type AppPage =
+  | 'home'
+  | 'people'
+  | 'follow'
+  | 'history'
+  | 'alerts'
+  | 'profile'
+  | 'voice'
 
 export function useSahayakApp() {
   const [lang, setLang] = useState<Language>('kn')
   const [page, setPage] = useState<AppPage>('home')
-  const [selected, setSelected] = useState<Beneficiary>(beneficiaries[1])
+  const [beneficiaries, setBeneficiaries] = useState<Beneficiary[]>([])
+  const [visits, setVisits] = useState<Visit[]>([])
+  const [followUps, setFollowUps] = useState<FollowUp[]>([])
+  const [alerts, setAlerts] = useState<Alert[]>([])
+  const [dashboard, setDashboard] = useState<Dashboard | null>(null)
+  const [selected, setSelected] = useState<Beneficiary | null>(null)
+  const [selectedVisit, setSelectedVisit] = useState<Visit | null>(null)
   const [filter, setFilter] = useState('All')
   const [followFilter, setFollowFilter] = useState('All')
   const [query, setQuery] = useState('')
   const [historyQuery, setHistoryQuery] = useState('')
-  const [scenario, setScenario] = useState<Scenario>(scenarios[1])
-  const [recording, setRecording] = useState(false)
-  const [, setSeconds] = useState(0)
-  const [weight, setWeight] = useState('')
-  const [visitType, setVisitType] = useState(visitTypeFor(beneficiaries[1]))
-  const [vaccines, setVaccines] = useState('')
-  const [nextDate, setNextDate] = useState('')
-  const [notes, setNotes] = useState('')
-  const [savedRecords, setSavedRecords] = useState<VisitRecord[]>([])
-  const [draftId, setDraftId] = useState(() => crypto.randomUUID())
-  const [confirmed, setConfirmed] = useState(false)
-  const [dangerAcknowledged, setDangerAcknowledged] = useState(false)
-  const [correction, setCorrection] = useState(false)
-  const [correctionField, setCorrectionField] = useState<'weight' | 'vaccines' | 'nextDate' | 'notes'>('weight')
-  const [correctionValue, setCorrectionValue] = useState('')
-  useEffect(() => { setSavedRecords(mockVisitStore.list()) }, [])
+  const [historyFrom, setHistoryFrom] = useState('')
+  const [historyTo, setHistoryTo] = useState('')
   const [mobileMenu, setMobileMenu] = useState(false)
-  const [readback, setReadback] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [busyAction, setBusyAction] = useState(false)
 
-  const filtered = useMemo(() => beneficiaries.filter((beneficiary) =>
-    (filter === 'All' || beneficiary.category === filter) &&
-    `${beneficiary.id} ${beneficiary.name}`.toLowerCase().includes(query.toLowerCase())), [filter, query])
+  const refresh = useCallback(async () => {
+    try {
+      const [nextDashboard, nextBeneficiaries, nextVisits, nextFollowUps, nextAlerts] =
+        await Promise.all([
+          apiService.getDashboard(),
+          apiService.getBeneficiaries(),
+          apiService.getVisits(),
+          apiService.getFollowUps(),
+          apiService.getAlerts(),
+        ])
+      setDashboard(nextDashboard)
+      setBeneficiaries(nextBeneficiaries)
+      setVisits(nextVisits)
+      setFollowUps(nextFollowUps)
+      setAlerts(nextAlerts)
+      setError('')
+      setSelected((current) =>
+        current
+          ? nextBeneficiaries.find(
+              (person) => person.beneficiary_id === current.beneficiary_id
+            ) || null
+          : null
+      )
+      setSelectedVisit((current) =>
+        current
+          ? nextVisits.find((visit) => visit.id === current.id) || null
+          : null
+      )
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : 'Unable to load records from the SAHAYAK backend.'
+      )
+    } finally {
+      setLoading(false)
+    }
+  }, [])
 
-  const safetyAssessment = safetyService.assess(scenario.transcript, scenario.lang as 'kn' | 'hi' | 'en')
-  const danger = safetyAssessment.flagged
-  const navigate = (nextPage: AppPage) => { if (nextPage === 'record') setConfirmed(false); setPage(nextPage); setMobileMenu(false) }
+  useEffect(() => {
+    void refresh()
+    return subscribeToDataUpdates(() => void refresh())
+  }, [refresh])
+
+  const navigate = (nextPage: AppPage) => {
+    setPage(nextPage)
+    setMobileMenu(false)
+    if (nextPage !== 'voice') void refresh()
+  }
+
   const chooseBeneficiary = (beneficiary: Beneficiary) => {
     setSelected(beneficiary)
-    setVisitType(visitTypeFor(beneficiary))
-  }
-  const chooseVisitType = (type: string) => {
-    setVisitType(type)
-    const category = type.includes('Pregnancy') ? 'Pregnant' : 'Newborn'
-    if (selected.category !== category) {
-      const matchingBeneficiary = beneficiaries.find((person) => person.category === category)
-      if (matchingBeneficiary) setSelected(matchingBeneficiary)
-    }
-  }
-  const begin = (beneficiary = selected, requestedVisitType?: string) => {
-    setSelected(beneficiary)
-    const defaultType = visitTypeFor(beneficiary)
-    setScenario(scenarios.find((sample) => sample.type === defaultType) || scenarios[0])
-    setWeight('')
-    setVaccines('')
-    setNextDate('')
-    setNotes('')
-    setVisitType(requestedVisitType || visitTypeFor(beneficiary))
-    setCorrection(false)
-    setConfirmed(false)
-    setDangerAcknowledged(false)
-    setDraftId(crypto.randomUUID())
-    setSeconds(0)
-    setRecording(false)
-    navigate('voice')
-  }
-  const loadScenario = (nextScenario: Scenario) => {
-    const category = nextScenario.type.includes('Pregnancy') ? 'Pregnant' : 'Newborn'
-    const matchingBeneficiary = beneficiaries.find((person) => person.category === category)
-    if (matchingBeneficiary) setSelected(matchingBeneficiary)
-    setScenario(nextScenario)
-    setConfirmed(false)
-    setDangerAcknowledged(false)
-    const extracted = extractionService.extract(nextScenario.transcript, nextScenario.lang as 'kn' | 'hi' | 'en')
-    setWeight(extracted.weightKg === null ? nextScenario.weight || '' : String(extracted.weightKg))
-    setVisitType(extracted.visitType || nextScenario.type)
-    setVaccines(extracted.vaccinationsDue?.join(', ') || nextScenario.vaccines || '')
-    setNextDate(extracted.nextVisitDate || nextScenario.date || '')
-    setNotes('')
-  }
-  const resetScenario = () => loadScenario(scenarios.find((sample) => sample.type === visitTypeFor(selected)) || scenarios[0])
-  const openRecord = (record: VisitRecord) => {
-    const beneficiary = beneficiaries.find((person) => person.id === record.beneficiaryId) || beneficiaries[0]
-    const recordScenario = scenarios.find((sample) => sample.type === record.type && sample.danger === record.danger) || scenarios.find((sample) => sample.type === record.type) || scenarios[0]
-    setSelected(beneficiary)
-    setScenario(recordScenario)
-    setWeight(record.weight)
-    setVisitType(record.type)
-    setNextDate(record.nextDate)
-    setVaccines(record.vaccines || recordScenario.vaccines || '')
-    setNotes(record.notes || '')
-    setConfirmed(false)
-    setDangerAcknowledged(false)
-    setDraftId(record.draftId || crypto.randomUUID())
-    setCorrection(false)
-    navigate('review')
-  }
-  const applyCorrection = () => {
-    if (!correctionValue.trim()) return
-    const value = correctionValue.trim()
-    if (correctionField === 'weight') setWeight(value)
-    if (correctionField === 'vaccines') setVaccines(value)
-    if (correctionField === 'nextDate') setNextDate(value)
-    if (correctionField === 'notes') setNotes(value)
-    setCorrectionValue('')
-    setCorrection(false)
-    setConfirmed(false)
-  }
-  const save = () => {
-    if (!confirmed || (danger && !dangerAcknowledged) || (!danger && (!weight.trim() || !nextDate.trim()))) return
-    const record: VisitRecord = {
-      id: `V-${draftId.slice(0, 8)}`,
-      draftId,
-      beneficiaryId: selected.id,
-      type: visitType,
-      date: new Intl.DateTimeFormat('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).format(new Date()),
-      nextDate: danger ? nextDate || 'Immediate referral' : nextDate,
-      status: danger ? 'Flagged' : 'Completed',
-      danger,
-      dangerFlags: safetyAssessment.signs,
-      weight,
-      vaccines,
-      notes,
-    }
-    mockVisitStore.save(record)
-    setSavedRecords(mockVisitStore.list())
-    navigate('saved')
-  }
-  const playDemo = () => {
-    setReadback(true)
-    window.setTimeout(() => setReadback(false), 1800)
   }
 
+  const begin = (beneficiary = selected) => {
+    setSelected(beneficiary)
+    setPage('voice')
+    setMobileMenu(false)
+  }
+
+  const filteredBeneficiaries = beneficiaries.filter((beneficiary) => {
+    const category = beneficiary.category.toLowerCase()
+    const categoryMatch =
+      filter === 'All' ||
+      (filter === 'Pregnant' && category.includes('preg')) ||
+      (filter === 'Newborn' && category.includes('newborn')) ||
+      (filter === 'Child' && category.includes('child')) ||
+      (filter === 'Other' &&
+        !['pregnant', 'pregnancy', 'newborn', 'child'].some((item) =>
+          category.includes(item)
+        ))
+    const queryMatch =
+      `${beneficiary.beneficiary_id} ${beneficiary.name} ${beneficiary.village}`
+        .toLowerCase()
+        .includes(query.toLowerCase())
+    return categoryMatch && queryMatch
+  })
+
+  const updateFollowUp = async (
+    id: number,
+    update: { scheduled_date?: string; status?: 'pending' | 'completed' }
+  ) => {
+    setBusyAction(true)
+    setError('')
+    try {
+      await apiService.updateFollowUp(id, update)
+      await refresh()
+    } catch (reason) {
+      setError(
+        reason instanceof Error ? reason.message : 'Follow-up update failed.'
+      )
+    } finally {
+      setBusyAction(false)
+    }
+  }
+
+  const acknowledgeAlert = async (id: number) => {
+    setBusyAction(true)
+    setError('')
+    try {
+      await apiService.acknowledgeAlert(id)
+      await refresh()
+    } catch (reason) {
+      setError(
+        reason instanceof Error ? reason.message : 'Alert update failed.'
+      )
+    } finally {
+      setBusyAction(false)
+    }
+  }
+
+  const updateReferralStatus = async (
+    id: number,
+    status: 'not_started' | 'referred' | 'follow_up_pending' | 'completed'
+  ) => {
+    setBusyAction(true)
+    setError('')
+    try {
+      await apiService.updateReferralStatus(id, status)
+      await refresh()
+    } catch (reason) {
+      setError(
+        reason instanceof Error ? reason.message : 'Referral update failed.'
+      )
+    } finally {
+      setBusyAction(false)
+    }
+  }
+
+  const filteredFollowUps = followUps.filter((followUp) => {
+    if (followFilter === 'All') return true
+    if (followFilter === 'Upcoming') return followUp.status === 'pending'
+    return followUp.status === followFilter.toLowerCase()
+  })
+
+  const filteredVisits = visits.filter((visit) => {
+    const matchesText =
+      `${visit.beneficiary_id} ${visit.beneficiary_name} ${visit.visit_type || ''}`
+        .toLowerCase()
+        .includes(historyQuery.toLowerCase())
+    const visitDate = visit.created_at?.slice(0, 10) || ''
+    return (
+      matchesText &&
+      (!historyFrom || visitDate >= historyFrom) &&
+      (!historyTo || visitDate <= historyTo)
+    )
+  })
+
   return {
-    lang, setLang, page, navigate, selected, setSelected, chooseBeneficiary, chooseVisitType, filter, setFilter,
-    followFilter, setFollowFilter, query, setQuery, historyQuery, setHistoryQuery, scenario,
-    setScenario, recording, setRecording, setSeconds, weight, setWeight, visitType, setVisitType,
-    vaccines, setVaccines, nextDate, setNextDate, notes, setNotes, savedRecords, correction,
-    setCorrection, correctionField, setCorrectionField, correctionValue, setCorrectionValue, applyCorrection,
-    confirmed, setConfirmed, dangerAcknowledged, setDangerAcknowledged, mobileMenu, setMobileMenu, readback, setReadback, filtered, danger, begin,
-    loadScenario, resetScenario, openRecord, save, playDemo, safetyAssessment,
+    lang,
+    setLang,
+    page,
+    navigate,
+    beneficiaries,
+    visits,
+    followUps,
+    alerts,
+    dashboard,
+    selected,
+    chooseBeneficiary,
+    selectedVisit,
+    setSelectedVisit,
+    filter,
+    setFilter,
+    followFilter,
+    setFollowFilter,
+    query,
+    setQuery,
+    historyQuery,
+    setHistoryQuery,
+    historyFrom,
+    setHistoryFrom,
+    historyTo,
+    setHistoryTo,
+    mobileMenu,
+    setMobileMenu,
+    loading,
+    error,
+    setError,
+    busyAction,
+    refresh,
+    begin,
+    filteredBeneficiaries,
+    filteredFollowUps,
+    filteredVisits,
+    updateFollowUp,
+    acknowledgeAlert,
+    updateReferralStatus,
   }
 }

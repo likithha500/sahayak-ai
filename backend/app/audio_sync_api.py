@@ -11,6 +11,7 @@ from fastapi import (
 )
 
 from .audio_sync_db import get_audio_status, save_audio
+from .database import match_beneficiary
 from .sync_api import require_sync_key
 
 router = APIRouter(
@@ -44,6 +45,16 @@ async def upload_audio(
             status_code=422,
             detail="Invalid beneficiary ID",
         )
+
+    match = match_beneficiary(beneficiary_id=beneficiary_id)
+    if match["status"] != "matched":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Beneficiary ID must uniquely match a registered record"
+            ),
+        )
+    beneficiary_id = match["matches"][0]["beneficiary_id"]
 
     if not recorded_at or len(recorded_at) > 64:
         raise HTTPException(
