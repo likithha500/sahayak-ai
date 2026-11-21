@@ -1,14 +1,11 @@
 
 import os
-import shutil
 import subprocess
 from io import BytesIO
-from pathlib import Path
 
 import requests
-from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+from .config import FFmpegUnavailableError, get_ffmpeg_executable
 
 GNANI_URL = "https://api.vachana.ai/stt/v3"
 
@@ -19,40 +16,6 @@ class GnaniError(Exception):
     pass
 
 
-def _ffmpeg_executable() -> str:
-    configured_path = os.getenv("FFMPEG_PATH", "").strip()
-    if configured_path:
-        executable = Path(configured_path).expanduser()
-        if executable.is_dir():
-            executable /= "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-        if executable.is_file():
-            return str(executable)
-        raise GnaniError("FFMPEG_PATH does not point to an executable")
-
-    executable = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
-    if executable:
-        return executable
-
-    local_app_data = os.getenv("LOCALAPPDATA")
-    if local_app_data:
-        package_root = (
-            Path(local_app_data)
-            / "Microsoft"
-            / "WinGet"
-            / "Packages"
-            / "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
-        )
-        candidates = sorted(
-            package_root.glob("ffmpeg-*/bin/ffmpeg.exe"),
-            reverse=True,
-        )
-        for candidate in candidates:
-            if candidate.is_file():
-                return str(candidate)
-
-    raise GnaniError("FFmpeg is not installed or not on PATH")
-
-
 def convert_to_wav(audio_data: bytes) -> bytes:
     """Convert browser audio to 16 kHz mono WAV."""
 
@@ -60,9 +23,10 @@ def convert_to_wav(audio_data: bytes) -> bytes:
         raise GnaniError("Audio is empty")
 
     try:
+        ffmpeg = get_ffmpeg_executable()
         result = subprocess.run(
             [
-                _ffmpeg_executable(),
+                ffmpeg,
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -83,8 +47,12 @@ def convert_to_wav(audio_data: bytes) -> bytes:
             timeout=30,
             check=False,
         )
+    except FFmpegUnavailableError as exc:
+        raise GnaniError(str(exc)) from exc
     except FileNotFoundError as exc:
-        raise GnaniError("FFmpeg is not installed") from exc
+        raise GnaniError(
+            "Configured FFmpeg executable was not found"
+        ) from exc
     except subprocess.TimeoutExpired as exc:
         raise GnaniError("Audio conversion timed out") from exc
 

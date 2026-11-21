@@ -9,13 +9,21 @@ import base64
 from .gnani_client import transcribe_audio, GnaniError
 from .gnani_tts import synthesize_speech
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .database import (
     initialize_database,
     list_beneficiaries,
+    search_beneficiaries,
+    create_beneficiary,
     list_visits,
     list_danger_alerts,
     get_beneficiary,
@@ -33,6 +41,7 @@ from .groq_llm import generate_reply, extract_visit
 from .schemas import (
     ExtractRequest,
     ExtractResponse,
+    BeneficiaryCreate,
     FollowUpUpdate,
     ReferralStatusUpdate,
 )
@@ -46,6 +55,7 @@ from .sync_db import init_sync_db
 # Phase 3: Audio synchronization
 from .audio_sync_api import router as audio_sync_router
 from .audio_sync_db import init_audio_sync_db
+from .config import DB_PATH, FFmpegUnavailableError, get_ffmpeg_executable
 
 
 logger = logging.getLogger(__name__)
@@ -62,7 +72,14 @@ async def lifespan(app: FastAPI):
     init_audio_sync_db()
     init_audio_processing_db()
 
-    logger.info("SAHAYAK AI database initialized")
+    logger.info("SAHAYAK AI database initialized at %s", DB_PATH)
+    try:
+        logger.info(
+            "FFmpeg available at %s",
+            get_ffmpeg_executable(),
+        )
+    except FFmpegUnavailableError as exc:
+        logger.warning("FFmpeg unavailable: %s", exc)
     yield
 
 
@@ -168,6 +185,35 @@ async def extract(request: ExtractRequest):
 @app.get("/api/beneficiaries")
 async def beneficiaries():
     return list_beneficiaries()
+
+
+@app.get("/api/beneficiaries/search")
+async def beneficiary_search(
+    q: str = Query(min_length=1, max_length=120),
+):
+    return search_beneficiaries(q)
+
+
+@app.post("/api/beneficiaries", status_code=201)
+async def beneficiary_create(payload: BeneficiaryCreate):
+    result = create_beneficiary(
+        payload.name,
+        payload.village,
+        payload.category,
+        payload.age,
+    )
+    if result["status"] == "duplicate":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "A similar beneficiary already exists in this "
+                    "village. Verify the record before registering."
+                ),
+                "candidates": result["matches"],
+            },
+        )
+    return result["beneficiary"]
 
 
 @app.get("/api/beneficiaries/{beneficiary_id}")

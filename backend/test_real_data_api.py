@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from app import audio_processing_db, audio_sync_db, database, sync_db
 from app.main import app
 from app.schemas import VisitExtraction
+from app.session import is_registration_intent
 
 
 def main():
@@ -22,24 +23,51 @@ def main():
 
         try:
             database.initialize_database()
+            assert is_registration_intent(
+                "Register a new synthetic beneficiary"
+            )
+            initial_beneficiaries = database.list_beneficiaries()
+            assert len(initial_beneficiaries) == 2
+            assert {
+                item["beneficiary_id"]
+                for item in initial_beneficiaries
+            } == {"AS-102", "AS-205"}
+            for spoken_id in (
+                "102",
+                "AS-102",
+                "AS one zero two",
+                "Beneficiary ID one hundred and two",
+            ):
+                match = database.match_beneficiary(
+                    beneficiary_id=spoken_id
+                )
+                assert match["status"] == "matched", spoken_id
+                assert (
+                    match["matches"][0]["beneficiary_id"]
+                    == "AS-102"
+                ), spoken_id
+            assert database.list_visits() == []
+            assert database.list_danger_alerts() == []
+            assert database.list_follow_ups() == []
+
             sync_db.init_sync_db()
             audio_sync_db.init_audio_sync_db()
             audio_processing_db.init_audio_processing_db()
             due_date = date.today() + timedelta(days=7)
             visit = VisitExtraction(
-                beneficiary_id="ASHA103",
+                beneficiary_id="AS-102",
                 visit_type="child",
                 weight_kg=18.5,
                 vaccinations_due=["Measles"],
                 next_visit_date=due_date,
             )
             visit_id = database.save_visit(
-                "ASHA103",
+                "AS-102",
                 visit,
                 idempotency_key="real-data-api-test",
             )
             duplicate_id = database.save_visit(
-                "ASHA103",
+                "AS-102",
                 visit,
                 idempotency_key="real-data-api-test",
             )
@@ -49,7 +77,7 @@ def main():
             offline_id = str(uuid4())
             audio_sync_db.save_audio(
                 offline_id,
-                "ASHA103",
+                "AS-102",
                 "2026-01-01T10:00:00Z",
                 "audio/webm",
                 b"synthetic-test-audio",
@@ -95,16 +123,58 @@ def main():
             alert_id = database.save_danger_alert(
                 "synthetic test alert",
                 "Synthetic urgent referral test",
-                beneficiary_id="ASHA103",
+                beneficiary_id="AS-102",
                 recommended_action="Contact the referral facility.",
             )
 
             with TestClient(app) as client:
-                beneficiary = client.get("/api/beneficiaries/103")
+                initial_beneficiaries = client.get(
+                    "/api/beneficiaries"
+                )
+                assert initial_beneficiaries.status_code == 200
+                assert len(initial_beneficiaries.json()) == 2
+                assert {
+                    item["beneficiary_id"]
+                    for item in initial_beneficiaries.json()
+                } == {"AS-102", "AS-205"}
+
+                created_beneficiary = client.post(
+                    "/api/beneficiaries",
+                    json={
+                        "name": "Anitha",
+                        "village": "Rampura",
+                        "age": 26,
+                        "category": "pregnancy",
+                    },
+                )
+                assert created_beneficiary.status_code == 201
+                created_record = created_beneficiary.json()
+                assert created_record["beneficiary_id"] == "AS-206"
+                assert created_record["age"] == 26
+                search = client.get(
+                    "/api/beneficiaries/search",
+                    params={"q": "Anitha"},
+                )
+                assert search.status_code == 200
+                assert search.json()[0]["beneficiary_id"] == "AS-206"
+
+                duplicate = client.post(
+                    "/api/beneficiaries",
+                    json={
+                        "name": "Anita",
+                        "village": "Rampura",
+                        "age": 26,
+                        "category": "pregnancy",
+                    },
+                )
+                assert duplicate.status_code == 409
+                assert len(database.list_beneficiaries()) == 3
+
+                beneficiary = client.get("/api/beneficiaries/102")
                 assert beneficiary.status_code == 200
-                assert beneficiary.json()["beneficiary_id"] == "ASHA103"
+                assert beneficiary.json()["beneficiary_id"] == "AS-102"
                 beneficiary_visits = client.get(
-                    "/api/beneficiaries/ASHA103/visits"
+                    "/api/beneficiaries/AS-102/visits"
                 )
                 assert beneficiary_visits.status_code == 200
                 assert any(
@@ -118,14 +188,14 @@ def main():
                     item for item in visits.json()
                     if item["id"] == visit_id
                 )
-                assert api_visit["beneficiary_name"] == "Meena"
+                assert api_visit["beneficiary_name"] == "Meena Kumari"
                 visit_detail = client.get(f"/api/visits/{visit_id}")
                 assert visit_detail.status_code == 200
                 assert visit_detail.json()["id"] == visit_id
 
                 dashboard = client.get("/api/dashboard")
                 assert dashboard.status_code == 200
-                assert dashboard.json()["stats"]["beneficiaries"] == 5
+                assert dashboard.json()["stats"]["beneficiaries"] == 3
                 assert dashboard.json()["stats"]["urgent_referrals"] == 1
 
                 follow_up_id = follow_ups[0]["id"]

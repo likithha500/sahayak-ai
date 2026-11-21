@@ -3,9 +3,9 @@
 import hashlib
 import json
 import sqlite3
-from pathlib import Path
 from contextlib import contextmanager
-DB_PATH = Path(__file__).resolve().parent.parent / "sahayak.db"
+
+from .config import DB_PATH
 
 
 def connect():

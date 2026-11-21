@@ -1,11 +1,13 @@
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
-from pathlib import Path
+from difflib import SequenceMatcher
 
-DB_PATH = Path(__file__).resolve().parent.parent / "sahayak.db"
+from .config import DB_PATH
+
 LOCAL_TZ = timezone(timedelta(hours=5, minutes=30))
 
 
@@ -28,9 +30,20 @@ def initialize_database():
                 beneficiary_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 category TEXT NOT NULL,
-                village TEXT NOT NULL
+                village TEXT NOT NULL,
+                age INTEGER
             )
         """)
+
+        beneficiary_columns = {
+            row["name"] for row in connection.execute(
+                "PRAGMA table_info(beneficiaries)"
+            ).fetchall()
+        }
+        if "age" not in beneficiary_columns:
+            connection.execute(
+                "ALTER TABLE beneficiaries ADD COLUMN age INTEGER"
+            )
 
         connection.execute("""
             CREATE TABLE IF NOT EXISTS visits (
@@ -137,11 +150,10 @@ def initialize_database():
         """)
 
         samples = [
-            ("ASHA101", "Anitha", "pregnancy", "Rampura"),
-            ("ASHA102", "Lakshmi", "newborn", "Rampura"),
-            ("ASHA103", "Meena", "child", "Rampura"),
-            ("ASHA104", "Lakshmi", "pregnancy", "Hoskote"),
-            ("ASHA105", "Suma", "postnatal", "Hoskote"),
+            ("AS-102", "Meena Kumari", "pregnancy",
+             "Development test village"),
+            ("AS-205", "Baby of Kavya", "newborn",
+             "Development test village"),
         ]
 
         connection.executemany("""
@@ -158,6 +170,7 @@ def list_beneficiaries():
                    beneficiaries.name,
                    beneficiaries.category,
                    beneficiaries.village,
+                   beneficiaries.age,
                    (SELECT visits.created_at FROM visits
                     WHERE visits.beneficiary_id =
                           beneficiaries.beneficiary_id
@@ -172,6 +185,113 @@ def list_beneficiaries():
             ORDER BY beneficiary_id
         """).fetchall()
         return [dict(row) for row in rows]
+
+
+def _possible_duplicate_rows(connection, name, village):
+    normalized_name = " ".join(name.casefold().split())
+    normalized_village = " ".join(village.casefold().split())
+    rows = connection.execute(
+        "SELECT * FROM beneficiaries ORDER BY beneficiary_id"
+    ).fetchall()
+
+    candidates = []
+    for row in rows:
+        existing_name = " ".join(row["name"].casefold().split())
+        existing_village = " ".join(row["village"].casefold().split())
+        similarity = SequenceMatcher(
+            None,
+            normalized_name,
+            existing_name,
+        ).ratio()
+        if (
+            existing_village == normalized_village
+            and similarity >= 0.84
+        ):
+            candidates.append(dict(row))
+    return candidates
+
+
+def search_beneficiaries(query):
+    query = query.strip()
+    if not query:
+        return list_beneficiaries()
+
+    pattern = f"%{query}%"
+    with get_connection() as connection:
+        rows = connection.execute("""
+            SELECT beneficiary_id, name, category, village, age
+            FROM beneficiaries
+            WHERE beneficiary_id LIKE ?
+               OR name LIKE ?
+               OR village LIKE ?
+            ORDER BY beneficiary_id
+        """, (pattern, pattern, pattern)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def find_possible_duplicates(name, village):
+    with get_connection() as connection:
+        return _possible_duplicate_rows(connection, name, village)
+
+
+def create_beneficiary(name, village, category, age=None):
+    """Create one beneficiary and allocate its ID under a write lock."""
+    with get_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        duplicates = _possible_duplicate_rows(
+            connection,
+            name,
+            village,
+        )
+        if duplicates:
+            return {
+                "status": "duplicate",
+                "matches": duplicates,
+            }
+
+        rows = connection.execute(
+            "SELECT beneficiary_id FROM beneficiaries"
+        ).fetchall()
+        used_ids = {
+            row["beneficiary_id"].casefold()
+            for row in rows
+        }
+        numeric_ids = [
+            int(match.group(1))
+            for row in rows
+            if (
+                match := re.fullmatch(
+                    r"AS-(\d+)",
+                    row["beneficiary_id"],
+                    re.IGNORECASE,
+                )
+            )
+        ]
+        next_number = max(numeric_ids, default=0) + 1
+        beneficiary_id = f"AS-{next_number:03d}"
+        while beneficiary_id.casefold() in used_ids:
+            next_number += 1
+            beneficiary_id = f"AS-{next_number:03d}"
+
+        connection.execute("""
+            INSERT INTO beneficiaries
+                (beneficiary_id, name, category, village, age)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            beneficiary_id,
+            name.strip(),
+            category,
+            village.strip(),
+            age,
+        ))
+        row = connection.execute(
+            "SELECT * FROM beneficiaries WHERE beneficiary_id = ?",
+            (beneficiary_id,),
+        ).fetchone()
+        return {
+            "status": "created",
+            "beneficiary": dict(row),
+        }
 
 
 def normalize_beneficiary_id(value):

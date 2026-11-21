@@ -2,7 +2,6 @@
 """API endpoints for real Gnani audio transcription."""
 
 import logging
-import shutil
 import subprocess
 from typing import Literal
 from uuid import UUID
@@ -21,6 +20,7 @@ from .audio_processing_db import (
     save_confirmed_offline_visit,
 )
 from .database import match_beneficiary
+from .config import FFmpegUnavailableError, get_ffmpeg_executable
 from .gnani_client import GnaniError, transcribe_audio
 from .groq_llm import extract_visit
 from .schemas import VisitExtraction
@@ -56,6 +56,7 @@ def public_result(job: dict) -> dict:
         "reviewed_transcript": job.get("reviewed_transcript"),
         "reviewed_at": job.get("reviewed_at"),
         "confirmed_visit_id": job.get("confirmed_visit_id"),
+        "processing_error": job.get("processing_error"),
         "visit_saved": job["status"] == "visit_saved",
     }
 
@@ -72,10 +73,10 @@ def check_duration(audio_data: bytes) -> None:
     Reject recordings longer than 30 seconds before
     calling Gnani.
     """
-    ffmpeg = shutil.which("ffmpeg")
-
-    if ffmpeg is None:
-        raise GnaniError("FFmpeg is not installed")
+    try:
+        ffmpeg = get_ffmpeg_executable()
+    except FFmpegUnavailableError as exc:
+        raise GnaniError(str(exc)) from exc
 
     if not audio_data:
         raise GnaniError("Recording is empty")
