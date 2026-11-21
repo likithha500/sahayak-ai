@@ -132,8 +132,8 @@ Examples of **candidate signs for verification against the four manuals** includ
 ### 1. Clone the repository
 
 ```bash
-git clone <YOUR_GITHUB_REPOSITORY_URL>
-cd <YOUR_REPOSITORY_FOLDER>
+git clone https://github.com/likithha500/sahayak-ai
+cd https://github.com/likithha500/sahayak-ai
 ```
 
 ### 2. Start the backend
