@@ -25,6 +25,7 @@ NO_WORDS = {
 class VisitSession:
     def __init__(self):
         self.pending_alert_ids = set()
+        self.alert_ids = set()
         self.reset_draft()
 
     def reset_draft(self):
