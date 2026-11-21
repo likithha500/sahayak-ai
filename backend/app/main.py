@@ -1,4 +1,5 @@
 
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -24,6 +25,7 @@ from .groq_llm import generate_reply, extract_visit
 from .schemas import ExtractRequest, ExtractResponse
 from .session import VisitSession
 from .safety import detect_danger_signs
+from .gnani_stt import connect_to_prisma
 
 
 logger = logging.getLogger(__name__)
@@ -187,8 +189,8 @@ async def voice_session(websocket: WebSocket):
             # --------------------------------------
             # BINARY AUDIO
             # --------------------------------------
-            # Gnani audio streaming integration
-            # will be connected separately.
+            # Real-time PCM forwarding to Prisma
+            # will be added in the next stage.
 
             if message.get("bytes") is not None:
                 continue
@@ -230,9 +232,52 @@ async def voice_session(websocket: WebSocket):
                 continue
 
             # --------------------------------------
+            # TEMPORARY PRISMA CONNECTION TEST
+            # --------------------------------------
+            # Tests the Gnani connection through
+            # the existing FastAPI WebSocket.
+            # Does not send microphone audio.
+
+            if event_type == "test_prisma":
+                try:
+                    async with await connect_to_prisma() as prisma:
+                        response = await asyncio.wait_for(
+                            prisma.recv(),
+                            timeout=15,
+                        )
+                        prisma_data = json.loads(response)
+
+                        if prisma_data.get("type") == "connected":
+                            await websocket.send_json({
+                                "type": "prisma_connected",
+                                "message": (
+                                    "Gnani Prisma v3.0 is ready"
+                                ),
+                            })
+                        else:
+                            await websocket.send_json({
+                                "type": "session_error",
+                                "message": (
+                                    "Prisma did not confirm readiness"
+                                ),
+                            })
+
+                except Exception:
+                    logger.exception(
+                        "Prisma connection test failed"
+                    )
+                    await websocket.send_json({
+                        "type": "session_error",
+                        "message": (
+                            "Unable to connect to Prisma"
+                        ),
+                    })
+
+                continue
+
+            # --------------------------------------
             # INTERRUPT
             # --------------------------------------
-            # This acknowledges an interrupt request.
             # Actual cancellation of ongoing TTS
             # or model generation is not yet wired.
 
@@ -384,11 +429,14 @@ async def voice_session(websocket: WebSocket):
                         ),
                     )
                 except Exception:
-                    logger.exception("Danger alert persistence failed")
+                    logger.exception(
+                        "Danger alert persistence failed"
+                    )
                     alert_persistence_failed = True
                     break
 
                 session.pending_alert_ids.add(alert_id)
+
                 await websocket.send_json({
                     "type": "danger_sign_detected",
                     "alert_id": alert_id,
@@ -404,8 +452,6 @@ async def voice_session(websocket: WebSocket):
                         "Visit processing was stopped; please retry."
                     ),
                 })
-                # Continue the OUTER WebSocket receive loop, not
-                # the inner danger-sign loop. No process_turn call.
                 continue
 
             # --------------------------------------
@@ -420,12 +466,7 @@ async def voice_session(websocket: WebSocket):
                 # Send the actual structured result.
                 await websocket.send_json(result)
 
-                # ----------------------------------
-                # FIX: NO DUPLICATE AGENT REPLIES
-                # ----------------------------------
-                # If the session already returned
-                # agent_reply, do not send it again.
-
+                # Avoid duplicate agent replies.
                 if result["type"] != "agent_reply":
                     reply_text = (
                         result.get("message")
