@@ -22,9 +22,13 @@ from .schemas import ExtractRequest, ExtractResponse
 from .session import VisitSession
 from .safety import detect_danger_signs
 
-# Phase 3: Offline synchronization
+# Phase 3: JSON draft synchronization
 from .sync_api import router as offline_sync_router
 from .sync_db import init_sync_db
+
+# Phase 3: Audio synchronization
+from .audio_sync_api import router as audio_sync_router
+from .audio_sync_db import init_audio_sync_db
 
 
 logger = logging.getLogger(__name__)
@@ -38,6 +42,8 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     initialize_database()
     init_sync_db()
+    init_audio_sync_db()
+
     logger.info("SAHAYAK AI database initialized")
     yield
 
@@ -49,7 +55,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SAHAYAK AI API",
     description="Voice-first ASHA healthcare field assistant",
-    version="0.6.0",
+    version="0.7.0",
     lifespan=lifespan,
 )
 
@@ -64,8 +70,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Phase 3: Register offline synchronization endpoints
+# Register offline synchronization endpoints
 app.include_router(offline_sync_router)
+app.include_router(audio_sync_router)
 
 
 # ==================================================
@@ -85,7 +92,7 @@ async def health():
     return {
         "status": "ok",
         "service": "sahayak-ai",
-        "version": "0.6.0",
+        "version": "0.7.0",
     }
 
 
