@@ -1,7 +1,8 @@
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-
+from pydantic import BaseModel
+from .groq_llm import generate_reply
 app = FastAPI(title="SAHAYAK AI API")
 
 app.add_middleware(
@@ -38,3 +39,17 @@ async def voice_session(websocket: WebSocket):
 
     except WebSocketDisconnect:
         pass
+
+class ChatRequest(BaseModel):
+    text: str
+
+
+@app.post("/api/chat")
+async def chat(request: ChatRequest):
+    reply = await generate_reply(request.text)
+
+    return {
+        "reply": reply,
+        "source": "groq-qwen"
+    }
+
