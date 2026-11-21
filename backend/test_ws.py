@@ -11,23 +11,28 @@ async def main():
     async with connect(uri) as websocket:
         print("Connected to SAHAYAK AI WebSocket")
 
-        # Receive connection confirmation
         welcome = await websocket.recv()
         print("SERVER:", welcome)
 
-        # Send sample ASHA visit transcript
         await websocket.send(json.dumps({
-            "type": "transcript_final",
+            "type": "extract_visit",
             "text": (
                 "Beneficiary ASHA102 Lakshmi, "
                 "newborn visit, weight 2.8 kg."
             ),
         }))
 
-        # Receive transcript and Qwen response
-        for _ in range(2):
-            response = await websocket.recv()
-            print("SERVER:", response)
+        response = await websocket.recv()
+        print("SERVER:", response)
+
+        data = json.loads(response)
+
+        if data.get("type") == "visit_draft":
+            print("\nStructured extraction successful!")
+            print(json.dumps(data["visit"], indent=2))
+            print("Saved:", data["saved"])
+        else:
+            print("\nExtraction failed; check backend logs.")
 
 
 if __name__ == "__main__":

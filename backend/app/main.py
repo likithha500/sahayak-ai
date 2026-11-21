@@ -3,25 +3,26 @@ import json
 import logging
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .groq_llm import generate_reply
+from .groq_llm import generate_reply, extract_visit
+from .schemas import ExtractRequest, ExtractResponse
 
-
-# --------------------------------------------------
-# Application setup
-# --------------------------------------------------
 
 app = FastAPI(
     title="SAHAYAK AI API",
     description="Voice-first ASHA healthcare field assistant",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,30 +31,18 @@ app.add_middleware(
 logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------
-# Request models
-# --------------------------------------------------
-
 class ChatRequest(BaseModel):
     text: str = Field(min_length=1)
 
-
-# --------------------------------------------------
-# Health check
-# --------------------------------------------------
 
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
         "service": "sahayak-ai",
-        "version": "0.2.0",
+        "version": "0.3.0",
     }
 
-
-# --------------------------------------------------
-# REST endpoint (for development testing)
-# --------------------------------------------------
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
@@ -65,9 +54,24 @@ async def chat(request: ChatRequest):
     }
 
 
-# --------------------------------------------------
-# WebSocket endpoint (frontend <-> backend)
-# --------------------------------------------------
+@app.post("/api/extract", response_model=ExtractResponse)
+async def extract(request: ExtractRequest):
+    try:
+        visit = await extract_visit(request.text)
+
+        return ExtractResponse(
+            visit=visit,
+            status="draft",
+            saved=False,
+        )
+
+    except Exception:
+        logger.exception("Visit extraction failed")
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to extract visit information",
+        )
+
 
 @app.websocket("/ws/voice")
 async def voice_session(websocket: WebSocket):
@@ -84,11 +88,10 @@ async def voice_session(websocket: WebSocket):
         while True:
             message = await websocket.receive()
 
-            # Handle disconnected client
             if message["type"] == "websocket.disconnect":
                 break
 
-            # Audio frames will be processed by Gnani later.
+            # Gnani audio streaming will be added later.
             if message.get("bytes") is not None:
                 continue
 
@@ -97,7 +100,6 @@ async def voice_session(websocket: WebSocket):
             if raw_text is None:
                 continue
 
-            # Parse frontend JSON messages
             try:
                 data = json.loads(raw_text)
             except json.JSONDecodeError:
@@ -115,10 +117,6 @@ async def voice_session(websocket: WebSocket):
                 continue
 
             event_type = data.get("type")
-
-            # --------------------------------------
-            # Final speech transcript -> Groq/Qwen
-            # --------------------------------------
 
             if event_type == "transcript_final":
                 transcript = data.get("text")
@@ -153,27 +151,43 @@ async def voice_session(websocket: WebSocket):
                         "message": "Unable to generate a reply",
                     })
 
-            # --------------------------------------
-            # Interrupt acknowledgement (temporary)
-            # --------------------------------------
+            elif event_type == "extract_visit":
+                transcript = data.get("text")
+
+                if not isinstance(transcript, str) or not transcript.strip():
+                    await websocket.send_json({
+                        "type": "session_error",
+                        "message": "Transcript cannot be empty",
+                    })
+                    continue
+
+                try:
+                    visit = await extract_visit(transcript.strip())
+
+                    await websocket.send_json({
+                        "type": "visit_draft",
+                        "visit": visit.model_dump(mode="json"),
+                        "status": "draft",
+                        "saved": False,
+                    })
+
+                except Exception:
+                    logger.exception("WebSocket extraction failed")
+
+                    await websocket.send_json({
+                        "type": "session_error",
+                        "message": "Unable to extract visit information",
+                    })
 
             elif event_type == "interrupt":
                 await websocket.send_json({
                     "type": "agent_interrupted",
                 })
 
-            # --------------------------------------
-            # Ping/pong for connection testing
-            # --------------------------------------
-
             elif event_type == "ping":
                 await websocket.send_json({
                     "type": "pong",
                 })
-
-            # --------------------------------------
-            # Unknown event
-            # --------------------------------------
 
             else:
                 await websocket.send_json({
