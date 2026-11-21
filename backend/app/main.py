@@ -170,10 +170,20 @@ async def voice_session(websocket: WebSocket):
     prisma_ws = None
     prisma_reader = None
     send_lock = asyncio.Lock()
+    browser_disconnected = False
 
     async def send_event(payload):
+        nonlocal browser_disconnected
+        if browser_disconnected:
+            raise WebSocketDisconnect(code=1006)
         async with send_lock:
-            await websocket.send_json(payload)
+            if browser_disconnected:
+                raise WebSocketDisconnect(code=1006)
+            try:
+                await websocket.send_json(payload)
+            except (WebSocketDisconnect, RuntimeError) as exc:
+                browser_disconnected = True
+                raise WebSocketDisconnect(code=1006) from exc
 
     async def read_prisma(connection):
         try:
@@ -187,13 +197,19 @@ async def voice_session(websocket: WebSocket):
                     await send_event({"type": "session_error", "message": "Prisma transcription error"})
         except asyncio.CancelledError:
             raise
+        except WebSocketDisconnect:
+            logger.info("Browser disconnected while reading Prisma")
         except Exception:
             logger.exception("Prisma reader stopped")
+            try:
+                await send_event({"type": "session_error", "message": "Gnani connection dropped. Stop and start voice again."})
+            except Exception:
+                pass
 
 
     logger.info("Voice WebSocket client connected")
 
-    await websocket.send_json({
+    await send_event({
         "type": "session_connected",
         "message": "SAHAYAK AI backend connected",
     })
@@ -218,11 +234,20 @@ async def voice_session(websocket: WebSocket):
             if message.get("bytes") is not None:
                 audio = message["bytes"]
                 if prisma_ws is not None and len(audio) == 1024:
+                    if prisma_ws.state.name != "OPEN":
+                        prisma_ws = None
+                        await send_event({"type": "session_error", "message": "Gnani connection closed. Stop and start voice again."})
+                        continue
                     try:
                         await prisma_ws.send(audio)
                     except Exception:
                         logger.exception("Prisma audio forwarding failed")
-                        await send_event({"type": "session_error", "message": "Audio streaming failed"})
+                        try:
+                            await prisma_ws.close()
+                        except Exception:
+                            pass
+                        prisma_ws = None
+                        await send_event({"type": "session_error", "message": "Gnani audio connection dropped. Stop and start voice again."})
                 continue
 
             raw = message.get("text")
@@ -243,7 +268,7 @@ async def voice_session(websocket: WebSocket):
                     )
 
             except (json.JSONDecodeError, ValueError):
-                await websocket.send_json({
+                await send_event({
                     "type": "session_error",
                     "message": "Invalid JSON message",
                 })
@@ -256,7 +281,7 @@ async def voice_session(websocket: WebSocket):
             # --------------------------------------
 
             if event_type == "ping":
-                await websocket.send_json({
+                await send_event({
                     "type": "pong",
                 })
                 continue
@@ -270,8 +295,18 @@ async def voice_session(websocket: WebSocket):
 
             if event_type == "start_stt":
                 if prisma_ws is not None:
-                    await send_event({"type": "stt_connected"})
-                    continue
+                    if prisma_ws.state.name == "OPEN" and prisma_reader is not None and not prisma_reader.done():
+                        await send_event({"type": "stt_connected"})
+                        continue
+                    try:
+                        await prisma_ws.close()
+                    except Exception:
+                        pass
+                    prisma_ws = None
+                    if prisma_reader is not None:
+                        prisma_reader.cancel()
+                        await asyncio.gather(prisma_reader, return_exceptions=True)
+                        prisma_reader = None
                 connection = None
                 try:
                     connection = await connect_to_prisma()
@@ -285,6 +320,7 @@ async def voice_session(websocket: WebSocket):
                     logger.exception("Failed to start Prisma")
                     if connection is not None:
                         await connection.close()
+                    prisma_ws = None
                     await send_event({"type": "session_error", "message": "Unable to start live transcription"})
                 continue
 
@@ -305,7 +341,7 @@ async def voice_session(websocket: WebSocket):
                 continue
 
             if event_type == "interrupt":
-                await websocket.send_json({
+                await send_event({
                     "type": "agent_interrupted",
                 })
                 continue
@@ -321,7 +357,7 @@ async def voice_session(websocket: WebSocket):
                     type(alert_id) is not int
                     or alert_id <= 0
                 ):
-                    await websocket.send_json({
+                    await send_event({
                         "type": "session_error",
                         "message": (
                             "A valid alert_id is required"
@@ -333,7 +369,7 @@ async def voice_session(websocket: WebSocket):
                     alert_id
                     not in session.pending_alert_ids
                 ):
-                    await websocket.send_json({
+                    await send_event({
                         "type": "session_error",
                         "message": (
                             "Alert does not belong "
@@ -354,7 +390,7 @@ async def voice_session(websocket: WebSocket):
                             alert_id
                         )
 
-                    await websocket.send_json({
+                    await send_event({
                         "type": (
                             "danger_alert_acknowledged"
                         ),
@@ -367,7 +403,7 @@ async def voice_session(websocket: WebSocket):
                         "Alert acknowledgement failed"
                     )
 
-                    await websocket.send_json({
+                    await send_event({
                         "type": "session_error",
                         "message": (
                             "Unable to acknowledge alert"
@@ -384,7 +420,7 @@ async def voice_session(websocket: WebSocket):
                 "transcript_final",
                 "extract_visit",
             }:
-                await websocket.send_json({
+                await send_event({
                     "type": "session_error",
                     "message": (
                         f"Unsupported event: "
@@ -399,7 +435,7 @@ async def voice_session(websocket: WebSocket):
                 not isinstance(transcript, str)
                 or not transcript.strip()
             ):
-                await websocket.send_json({
+                await send_event({
                     "type": "session_error",
                     "message": (
                         "Transcript cannot be empty"
@@ -414,7 +450,7 @@ async def voice_session(websocket: WebSocket):
             # --------------------------------------
 
             if event_type == "transcript_final":
-                await websocket.send_json({
+                await send_event({
                     "type": "transcript_final",
                     "text": transcript,
                 })
@@ -457,7 +493,7 @@ async def voice_session(websocket: WebSocket):
                     break
 
                 session.pending_alert_ids.add(alert_id)
-                await websocket.send_json({
+                await send_event({
                     "type": "danger_sign_detected",
                     "alert_id": alert_id,
                     **danger,
@@ -465,7 +501,7 @@ async def voice_session(websocket: WebSocket):
                 })
 
             if alert_persistence_failed:
-                await websocket.send_json({
+                await send_event({
                     "type": "session_error",
                     "message": (
                         "Urgent safety alert could not be recorded. "
@@ -486,7 +522,7 @@ async def voice_session(websocket: WebSocket):
                 )
 
                 # Send the actual structured result.
-                await websocket.send_json(result)
+                await send_event(result)
 
                 # ----------------------------------
                 # FIX: NO DUPLICATE AGENT REPLIES
@@ -501,17 +537,19 @@ async def voice_session(websocket: WebSocket):
                     )
 
                     if reply_text:
-                        await websocket.send_json({
+                        await send_event({
                             "type": "agent_reply",
                             "text": reply_text,
                         })
 
+            except WebSocketDisconnect:
+                raise
             except Exception:
                 logger.exception(
                     "Voice session processing failed"
                 )
 
-                await websocket.send_json({
+                await send_event({
                     "type": "session_error",
                     "message": (
                         "Unable to process visit"
@@ -533,7 +571,10 @@ async def voice_session(websocket: WebSocket):
             prisma_reader.cancel()
             await asyncio.gather(prisma_reader, return_exceptions=True)
         if prisma_ws is not None:
-            await prisma_ws.close()
+            try:
+                await prisma_ws.close()
+            except Exception:
+                logger.debug("Prisma connection already closed", exc_info=True)
         logger.info(
             "Voice WebSocket session ended"
         )

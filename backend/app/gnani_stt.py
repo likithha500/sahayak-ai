@@ -29,5 +29,6 @@ async def connect_to_prisma():
     return await websockets.connect(
         GNANI_STT_URL,
         additional_headers=headers,
-        open_timeout=15,
+        open_timeout=30,
+        ping_interval=None,  # Gnani streaming endpoint may not answer client WebSocket pings
     )
