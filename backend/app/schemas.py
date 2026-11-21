@@ -27,6 +27,47 @@ class VisitExtraction(BaseModel):
         return value.strip() or None
 
 
+class BeneficiaryCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    village: str = Field(min_length=2, max_length=120)
+    category: Literal[
+        "pregnancy",
+        "newborn",
+        "child",
+        "postnatal",
+        "general",
+    ]
+    age: int | None = Field(default=None, ge=1, le=120)
+
+    @field_validator("name", "village")
+    @classmethod
+    def clean_required_text(cls, value: str):
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("This field cannot be blank")
+        return cleaned
+
+
+class BeneficiaryRegistrationExtraction(BaseModel):
+    name: str | None = Field(default=None, max_length=120)
+    village: str | None = Field(default=None, max_length=120)
+    category: Literal[
+        "pregnancy",
+        "newborn",
+        "child",
+        "postnatal",
+        "general",
+    ] | None = None
+    age: int | None = Field(default=None, ge=1, le=120)
+
+    @field_validator("name", "village")
+    @classmethod
+    def clean_optional_text(cls, value: str | None):
+        if value is None:
+            return None
+        return value.strip() or None
+
+
 class ExtractRequest(BaseModel):
     text: str = Field(min_length=1)
 

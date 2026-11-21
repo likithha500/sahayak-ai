@@ -8,7 +8,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 from groq import AsyncGroq
 
-from .schemas import VisitExtraction
+from .schemas import (
+    BeneficiaryRegistrationExtraction,
+    VisitExtraction,
+)
 
 
 load_dotenv(
@@ -57,8 +60,8 @@ Follow the current backend visit state.
 When the backend provides the next question,
 ask that question naturally in the worker's language.
 
-Do not introduce additional required fields that
-the backend cannot record.
+Do not require fields beyond the backend's
+supported visit schema.
 
 Accept corrections patiently.
 
@@ -196,6 +199,31 @@ EXTRACTION RULES:
 """
 
 
+REGISTRATION_EXTRACTION_PROMPT = """
+Extract details explicitly supplied for registering one new beneficiary.
+
+Return ONLY JSON with exactly these keys:
+{
+  "name": null,
+  "village": null,
+  "category": null,
+  "age": null
+}
+
+Rules:
+- Extract only information explicitly stated by the worker.
+- Never create or guess a beneficiary ID.
+- category must be pregnancy, newborn, child, postnatal, general, or null.
+- age must be an integer in years or null.
+- Convert clear spoken numbers in Kannada, Hindi, or English to integers.
+- Resolve corrections by returning the corrected value.
+- Use expected_field only to interpret a short, unambiguous answer.
+- Never interpret yes/no confirmation as beneficiary information.
+- Do not infer a category from a name, age, or village.
+- Output JSON only, without markdown or commentary.
+"""
+
+
 def get_model() -> str:
     model = os.environ.get("GROQ_MODEL")
 
@@ -284,5 +312,44 @@ async def extract_visit(
         )
 
     return VisitExtraction.model_validate(
+        extracted_data
+    )
+
+
+async def extract_beneficiary_registration(
+    user_text: str,
+    expected_field: str | None = None,
+) -> BeneficiaryRegistrationExtraction:
+    context = (
+        f"Expected field: {expected_field or 'unspecified'}\n"
+        f"Worker's transcript:\n{user_text}"
+    )
+    response = await client.chat.completions.create(
+        model=get_model(),
+        messages=[
+            {
+                "role": "system",
+                "content": REGISTRATION_EXTRACTION_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": context,
+            },
+        ],
+        temperature=0,
+        max_completion_tokens=180,
+        response_format={"type": "json_object"},
+    )
+    raw_content = response.choices[0].message.content
+    if not raw_content:
+        raise ValueError(
+            "Groq returned an empty registration extraction"
+        )
+    extracted_data = json.loads(raw_content)
+    if not isinstance(extracted_data, dict):
+        raise ValueError(
+            "Groq returned an invalid registration structure"
+        )
+    return BeneficiaryRegistrationExtraction.model_validate(
         extracted_data
     )
