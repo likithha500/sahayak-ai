@@ -49,6 +49,28 @@ def initialize_database():
             )
         """)
 
+        # Backward-compatible migration: preserve existing alerts and visits.
+        existing = {
+            row["name"] for row in connection.execute(
+                "PRAGMA table_info(danger_alerts)"
+            ).fetchall()
+        }
+        additions = {
+            "severity": "TEXT NOT NULL DEFAULT 'urgent'",
+            "matched_sign": "TEXT",
+            "guideline_document": "TEXT",
+            "guideline_page": "INTEGER",
+            "recommended_action": "TEXT",
+            "referral_status": "TEXT NOT NULL DEFAULT 'not_started'",
+            "acknowledged_at": "TEXT",
+            "referral_updated_at": "TEXT",
+        }
+        for column, declaration in additions.items():
+            if column not in existing:
+                connection.execute(
+                    f"ALTER TABLE danger_alerts ADD COLUMN {column} {declaration}"
+                )
+
         samples = [
             ("ASHA101", "Anitha", "pregnancy", "Rampura"),
             ("ASHA102", "Lakshmi", "newborn", "Rampura"),
@@ -187,14 +209,20 @@ def list_visits():
         return result
 
 
-def save_danger_alert(danger_type, transcript, beneficiary_id=None):
+def save_danger_alert(danger_type, transcript, beneficiary_id=None, *,
+                      severity="urgent", matched_sign=None,
+                      guideline_document=None, guideline_page=None,
+                      recommended_action=None):
     with get_connection() as connection:
         cursor = connection.execute("""
             INSERT INTO danger_alerts (
-                beneficiary_id, danger_type, transcript
-            )
-            VALUES (?, ?, ?)
-        """, (beneficiary_id, danger_type, transcript))
+                beneficiary_id, danger_type, transcript, severity,
+                matched_sign, guideline_document, guideline_page,
+                recommended_action
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (beneficiary_id, danger_type, transcript, severity,
+              matched_sign, guideline_document, guideline_page,
+              recommended_action))
         return cursor.lastrowid
 
 
@@ -202,16 +230,31 @@ def acknowledge_danger_alert(alert_id):
     with get_connection() as connection:
         cursor = connection.execute("""
             UPDATE danger_alerts
-            SET acknowledged = 1
+            SET acknowledged = 1,
+                acknowledged_at = COALESCE(acknowledged_at, CURRENT_TIMESTAMP)
             WHERE id = ?
         """, (alert_id,))
+        return cursor.rowcount > 0
+
+
+REFERRAL_STATUSES = {"not_started", "referred", "follow_up_pending", "completed"}
+
+
+def update_referral_status(alert_id, status):
+    if status not in REFERRAL_STATUSES:
+        raise ValueError("Unsupported referral status")
+    with get_connection() as connection:
+        cursor = connection.execute("""
+            UPDATE danger_alerts
+            SET referral_status = ?, referral_updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (status, alert_id))
         return cursor.rowcount > 0
 
 
 def list_danger_alerts():
     with get_connection() as connection:
         rows = connection.execute("""
-            SELECT * FROM danger_alerts
-            ORDER BY id DESC
+            SELECT * FROM danger_alerts ORDER BY id DESC
         """).fetchall()
         return [dict(row) for row in rows]

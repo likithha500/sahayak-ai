@@ -19,6 +19,8 @@ from .database import (
     list_danger_alerts,
     save_danger_alert,
     acknowledge_danger_alert,
+    update_referral_status,
+    REFERRAL_STATUSES,
 )
 from .groq_llm import generate_reply, extract_visit
 from .schemas import ExtractRequest, ExtractResponse
@@ -47,7 +49,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SAHAYAK AI API",
     description="Voice-first ASHA healthcare field assistant",
-    version="0.4.2",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -80,7 +82,7 @@ async def health():
     return {
         "status": "ok",
         "service": "sahayak-ai",
-        "version": "0.4.2",
+        "version": "0.5.0",
     }
 
 
@@ -309,6 +311,41 @@ async def voice_session(websocket: WebSocket):
                 continue
 
             # --------------------------------------
+            # REFERRAL STATUS (not an acknowledgement)
+            # --------------------------------------
+            if event_type == "update_referral_status":
+                alert_id = data.get("alert_id")
+                status = data.get("status")
+                if type(alert_id) is not int or alert_id <= 0 or status not in REFERRAL_STATUSES:
+                    await websocket.send_json({
+                        "type": "session_error",
+                        "message": "Valid alert_id and referral status required",
+                    })
+                    continue
+                # Restrict changes to alerts raised in this active session.
+                if alert_id not in session.alert_ids:
+                    await websocket.send_json({
+                        "type": "session_error",
+                        "message": "Alert does not belong to this active session",
+                    })
+                    continue
+                try:
+                    updated = update_referral_status(alert_id, status)
+                    await websocket.send_json({
+                        "type": "referral_status_updated",
+                        "alert_id": alert_id,
+                        "status": status,
+                        "updated": updated,
+                    })
+                except Exception:
+                    logger.exception("Referral status update failed")
+                    await websocket.send_json({
+                        "type": "session_error",
+                        "message": "Unable to update referral status",
+                    })
+                continue
+
+            # --------------------------------------
             # VALIDATE TRANSCRIPT EVENT
             # --------------------------------------
 
@@ -382,6 +419,11 @@ async def voice_session(websocket: WebSocket):
                             if session.beneficiary
                             else None
                         ),
+                        severity=danger["severity"],
+                        matched_sign=danger["matched_sign"],
+                        guideline_document=danger["guideline_document"],
+                        guideline_page=danger["guideline_page"],
+                        recommended_action=danger["recommended_action"],
                     )
                 except Exception:
                     logger.exception("Danger alert persistence failed")
@@ -389,6 +431,7 @@ async def voice_session(websocket: WebSocket):
                     break
 
                 session.pending_alert_ids.add(alert_id)
+                session.alert_ids.add(alert_id)
                 await websocket.send_json({
                     "type": "danger_sign_detected",
                     "alert_id": alert_id,
