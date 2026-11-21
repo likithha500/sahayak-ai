@@ -19,12 +19,24 @@ const labels = {
   kn: { request: 'ರೆಕಾರ್ಡ್ ಮಾಡಲು ಮೈಕ್ರೊಫೋನ್ ಅನುಮತಿಸಿ', start: 'ರೆಕಾರ್ಡಿಂಗ್ ಪ್ರಾರಂಭಿಸಿ', pause: 'ರೆಕಾರ್ಡಿಂಗ್ ವಿರಾಮಗೊಳಿಸಿ', resume: 'ರೆಕಾರ್ಡಿಂಗ್ ಮುಂದುವರಿಸಿ', stop: 'ರೆಕಾರ್ಡಿಂಗ್ ನಿಲ್ಲಿಸಿ', ready: 'ರೆಕಾರ್ಡ್ ಮಾಡಲು ಸಿದ್ಧ', recording: 'ಈ ಸಾಧನದಲ್ಲಿ ಆಡಿಯೊ ರೆಕಾರ್ಡ್ ಆಗುತ್ತಿದೆ', paused: 'ರೆಕಾರ್ಡಿಂಗ್ ವಿರಾಮದಲ್ಲಿದೆ', stopped: 'ರೆಕಾರ್ಡಿಂಗ್ ಪೂರ್ಣಗೊಂಡಿದೆ', permission: 'ಮೈಕ್ರೊಫೋನ್ ಅನುಮತಿ ನಿರಾಕರಿಸಲಾಗಿದೆ. ಬ್ರೌಸರ್ ಸೆಟ್ಟಿಂಗ್‌ಗಳಲ್ಲಿ ಅನುಮತಿಸಿ ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ.', unsupported: 'ಈ ಬ್ರೌಸರ್‌ನಲ್ಲಿ ಆಡಿಯೊ ರೆಕಾರ್ಡಿಂಗ್ ಲಭ್ಯವಿಲ್ಲ.', failed: 'ಆಡಿಯೊ ರೆಕಾರ್ಡ್ ಆಗಲಿಲ್ಲ. ಮೈಕ್ರೊಫೋನ್ ಪರಿಶೀಲಿಸಿ ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ.', playback: 'ರೆಕಾರ್ಡ್ ಮಾಡಿದ ಆಡಿಯೊ ಪ್ಲೇಬ್ಯಾಕ್', playAudio: 'ರೆಕಾರ್ಡ್ ಮಾಡಿದ ಆಡಿಯೊ ಪ್ಲೇ ಮಾಡಿ', pauseAudio: 'ಪ್ಲೇಬ್ಯಾಕ್ ವಿರಾಮಗೊಳಿಸಿ', local: 'ಆಡಿಯೊ ಈ ಸಾಧನದಲ್ಲೇ ಇರುತ್ತದೆ. ಮಾತಿನ ಗುರುತಿಸುವಿಕೆ ಅಥವಾ ಪ್ರತಿಲಿಪಿ ಸಕ್ರಿಯವಾಗಿಲ್ಲ.', permissionDenied: 'ಮೈಕ್ರೊಫೋನ್ ಅನುಮತಿ ನಿರಾಕರಿಸಲಾಗಿದೆ.' },
 } as const
 
+function pcmFrame(samples: number[]): ArrayBuffer {
+  const buffer = new ArrayBuffer(1024)
+  const view = new DataView(buffer)
+  samples.forEach((sample, i) => {
+    const clipped = Math.max(-1, Math.min(1, sample))
+    view.setInt16(i * 2, clipped < 0 ? clipped * 32768 : clipped * 32767, true)
+  })
+  return buffer
+}
+
 export function VoiceRecorder({ lang, onStateChange, onDurationChange, onContinue, continueLabel }: Props) {
   const text = labels[lang]
   const [state, setState] = useState<RecorderState>('idle')
   const [error, setError] = useState('')
   const [audioUrl, setAudioUrl] = useState('')
   const [playing, setPlaying] = useState(false)
+  const [transcript, setTranscript] = useState('')
+  const [sttStatus, setSttStatus] = useState('Not connected')
   const [levels, setLevels] = useState<number[]>(Array(37).fill(8))
   const recorderRef = useRef<MediaRecorder | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
@@ -38,6 +50,15 @@ export function VoiceRecorder({ lang, onStateChange, onDurationChange, onContinu
   const analyserRef = useRef<AnalyserNode | null>(null)
   const mountedRef = useRef(true)
   const failedRef = useRef(false)
+  const socketRef = useRef<WebSocket | null>(null)
+  const processorRef = useRef<ScriptProcessorNode | null>(null)
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
+  const muteRef = useRef<GainNode | null>(null)
+  const pcmPendingRef = useRef<number[]>([])
+  const pcmQueueRef = useRef<ArrayBuffer[]>([])
+  const sendTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const isPausedRef = useRef(false)
+  const transcriptRef = useRef('')
 
   useEffect(() => {
     mountedRef.current = true
@@ -46,6 +67,11 @@ export function VoiceRecorder({ lang, onStateChange, onDurationChange, onContinu
       if (animationRef.current !== null) cancelAnimationFrame(animationRef.current)
       if (recorderRef.current?.state !== 'inactive') recorderRef.current?.stop()
       streamRef.current?.getTracks().forEach((track) => track.stop())
+      if (sendTimerRef.current) clearInterval(sendTimerRef.current)
+      socketRef.current?.close()
+      processorRef.current?.disconnect()
+      sourceRef.current?.disconnect()
+      muteRef.current?.disconnect()
       void audioContextRef.current?.close()
       if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current)
     }
@@ -74,7 +100,38 @@ export function VoiceRecorder({ lang, onStateChange, onDurationChange, onContinu
     }
   }, [state, onDurationChange])
 
+  const stopLiveStream = () => {
+    if (sendTimerRef.current) clearInterval(sendTimerRef.current)
+    sendTimerRef.current = null
+    processorRef.current?.disconnect()
+    sourceRef.current?.disconnect()
+    muteRef.current?.disconnect()
+    processorRef.current = null
+    sourceRef.current = null
+    muteRef.current = null
+    const socket = socketRef.current
+    if (socket?.readyState === WebSocket.OPEN) {
+      const pending = pcmPendingRef.current
+      if (pending.length) {
+        while (pending.length < 512) pending.push(0)
+        pcmQueueRef.current.push(pcmFrame(pending.splice(0, 512)))
+      }
+      const flush = setInterval(() => {
+        if (socket.readyState !== WebSocket.OPEN) { clearInterval(flush); return }
+        const frame = pcmQueueRef.current.shift()
+        if (frame) socket.send(frame)
+        else {
+          clearInterval(flush)
+          socket.send(JSON.stringify({ type: 'stop_stt' }))
+          setTimeout(() => { if (socket.readyState === WebSocket.OPEN) socket.close() }, 3500)
+        }
+      }, 32)
+    } else socket?.close()
+    pcmPendingRef.current = []
+  }
+
   const stop = () => {
+    stopLiveStream()
     const recorder = recorderRef.current
     if (recorder?.state === 'recording') {
       elapsedRef.current += Math.floor((Date.now() - startedAtRef.current) / 1000)
@@ -91,6 +148,9 @@ export function VoiceRecorder({ lang, onStateChange, onDurationChange, onContinu
 
   const start = async () => {
     setError('')
+    setTranscript('')
+    transcriptRef.current = ''
+    setSttStatus('Connecting to Prisma...')
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
       setError(text.unsupported)
       setState('error')
@@ -102,6 +162,9 @@ export function VoiceRecorder({ lang, onStateChange, onDurationChange, onContinu
         stream.getTracks().forEach((track) => track.stop())
         return
       }
+      isPausedRef.current = false
+      pcmPendingRef.current = []
+      pcmQueueRef.current = []
       failedRef.current = false
       const preferredType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'].find((type) => MediaRecorder.isTypeSupported(type))
       const recorder = new MediaRecorder(stream, preferredType ? { mimeType: preferredType } : undefined)
@@ -141,12 +204,78 @@ export function VoiceRecorder({ lang, onStateChange, onDurationChange, onContinu
       } catch {
         analyserRef.current = null
       }
+      // Establish a persistent backend WebSocket before streaming PCM.
+      const wsUrl = (process.env.NEXT_PUBLIC_WS_URL || 'ws://127.0.0.1:8000/ws/voice')
+      const socket = new WebSocket(wsUrl)
+      socketRef.current = socket
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('WebSocket connection timed out')), 12000)
+        socket.onopen = () => socket.send(JSON.stringify({ type: 'start_stt' }))
+        socket.onerror = () => { clearTimeout(timeout); reject(new Error('WebSocket connection failed')) }
+        socket.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data)
+            if (data.type === 'stt_connected') { clearTimeout(timeout); setSttStatus('Live transcription connected'); resolve() }
+            if (data.type === 'stt_transcript' && typeof data.text === 'string') {
+              transcriptRef.current = `${transcriptRef.current} ${data.text}`.trim()
+              setTranscript(transcriptRef.current)
+              // Route recognized speech through existing safety and visit logic.
+              socket.send(JSON.stringify({ type: 'transcript_final', text: data.text }))
+            }
+            if (data.type === 'session_error') { setSttStatus(data.message || 'Speech recognition error') }
+          } catch { /* Ignore malformed server events. */ }
+        }
+      })
+
+      const context = audioContextRef.current || new AudioContext()
+      if (!audioContextRef.current) audioContextRef.current = context
+      await context.resume()
+      const source = context.createMediaStreamSource(stream)
+      const processor = context.createScriptProcessor(4096, 1, 1)
+      const mute = context.createGain()
+      mute.gain.value = 0
+      source.connect(processor)
+      processor.connect(mute)
+      mute.connect(context.destination)
+      sourceRef.current = source
+      processorRef.current = processor
+      muteRef.current = mute
+      let fractionalPosition = 0
+      let previousSample = 0
+      processor.onaudioprocess = (event) => {
+        if (isPausedRef.current) return
+        const input = event.inputBuffer.getChannelData(0)
+        const step = context.sampleRate / 16000
+        // Interpolate across callback boundaries, producing 16 kHz mono samples.
+        for (let position = fractionalPosition; position < input.length; position += step) {
+          const index = Math.floor(position)
+          const fraction = position - index
+          const left = index >= 0 ? input[index] : previousSample
+          const right = input[Math.min(index + 1, input.length - 1)]
+          pcmPendingRef.current.push(left + (right - left) * fraction)
+          if (pcmPendingRef.current.length >= 512) {
+            pcmQueueRef.current.push(pcmFrame(pcmPendingRef.current.splice(0, 512)))
+          }
+          fractionalPosition = position + step - input.length
+        }
+        previousSample = input[input.length - 1]
+      }
+      sendTimerRef.current = setInterval(() => {
+        if (socket.readyState === WebSocket.OPEN && pcmQueueRef.current.length) {
+          socket.send(pcmQueueRef.current.shift()!)
+        }
+      }, 32)
+
       recorder.start(250)
       startedAtRef.current = Date.now()
       setState('recording')
       onStateChange(true)
     } catch (cause) {
       const denied = cause instanceof DOMException && (cause.name === 'NotAllowedError' || cause.name === 'SecurityError')
+      stopLiveStream()
+      streamRef.current?.getTracks().forEach((track) => track.stop())
+      void audioContextRef.current?.close()
+      audioContextRef.current = null
       setError(denied ? text.permission : text.failed)
       setState('error')
       onStateChange(false)
@@ -158,10 +287,12 @@ export function VoiceRecorder({ lang, onStateChange, onDurationChange, onContinu
     if (!recorder || (recorder.state !== 'recording' && recorder.state !== 'paused')) return
     if (recorder.state === 'recording') {
       elapsedRef.current += Math.floor((Date.now() - startedAtRef.current) / 1000)
+      isPausedRef.current = true
       recorder.pause()
       setState('paused')
     } else {
       startedAtRef.current = Date.now()
+      isPausedRef.current = false
       recorder.resume()
       setState('recording')
     }
@@ -185,8 +316,9 @@ export function VoiceRecorder({ lang, onStateChange, onDurationChange, onContinu
       <div className="record-time"><span className={state === 'recording' ? 'live-dot' : ''} />{timerLabel} <span>·</span> {status}</div>
     </div>
     {error && <p className="recorder-error" role="alert">{error}</p>}
-    <div className="recorder-note"><Mic size={15} /><span>{text.local}</span></div>
+    <div className="recorder-note"><Mic size={15} /><span>{sttStatus}</span></div>
+    <div className="recorded-audio" aria-live="polite"><div><b>Live transcript</b><p>{transcript || 'Speak into your microphone to see recognized speech here.'}</p></div></div>
     {audioUrl && <div className="recorded-audio"><div><b>{text.playback}</b><small>{text.stopped}</small></div><button className="recorder-control" aria-label={playing ? text.pauseAudio : text.playAudio} onClick={() => { const audio = audioRef.current; if (!audio) return; if (playing) audio.pause(); else void audio.play() }}><span className="sr-only">{playing ? text.pauseAudio : text.playAudio}</span>{playing ? <Pause size={17} /> : <Play size={17} />}</button><audio ref={audioRef} src={audioUrl} controls preload="metadata" onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} aria-label={text.playback} /></div>}
-    <div className="voice-footer"><button className="button-primary" onClick={() => { if (recorderRef.current?.state !== 'inactive' && recorderRef.current) stop(); onContinue() }}>{continueLabel}<ArrowRight size={17}/></button></div>
+    <div className="voice-footer"><button className="button-primary" onClick={() => { if (recorderRef.current?.state !== 'inactive' && recorderRef.current) stop(); onContinue() }}>{continueLabel}<ArrowRight size={17} /></button></div>
   </>
 }

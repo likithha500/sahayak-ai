@@ -167,6 +167,29 @@ async def voice_session(websocket: WebSocket):
 
     # Each WebSocket connection has its own visit draft.
     session = VisitSession()
+    prisma_ws = None
+    prisma_reader = None
+    send_lock = asyncio.Lock()
+
+    async def send_event(payload):
+        async with send_lock:
+            await websocket.send_json(payload)
+
+    async def read_prisma(connection):
+        try:
+            async for raw_event in connection:
+                event = json.loads(raw_event)
+                if event.get("type") == "transcript" and event.get("is_final", True):
+                    text = event.get("text", "").strip()
+                    if text:
+                        await send_event({"type": "stt_transcript", "text": text, "language": event.get("detected_language_code")})
+                elif event.get("type") == "error":
+                    await send_event({"type": "session_error", "message": "Prisma transcription error"})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Prisma reader stopped")
+
 
     logger.info("Voice WebSocket client connected")
 
@@ -189,10 +212,17 @@ async def voice_session(websocket: WebSocket):
             # --------------------------------------
             # BINARY AUDIO
             # --------------------------------------
-            # Real-time PCM forwarding to Prisma
-            # will be added in the next stage.
+            # Gnani audio streaming integration
+            # will be connected separately.
 
             if message.get("bytes") is not None:
+                audio = message["bytes"]
+                if prisma_ws is not None and len(audio) == 1024:
+                    try:
+                        await prisma_ws.send(audio)
+                    except Exception:
+                        logger.exception("Prisma audio forwarding failed")
+                        await send_event({"type": "session_error", "message": "Audio streaming failed"})
                 continue
 
             raw = message.get("text")
@@ -232,54 +262,47 @@ async def voice_session(websocket: WebSocket):
                 continue
 
             # --------------------------------------
-            # TEMPORARY PRISMA CONNECTION TEST
-            # --------------------------------------
-            # Tests the Gnani connection through
-            # the existing FastAPI WebSocket.
-            # Does not send microphone audio.
-
-            if event_type == "test_prisma":
-                try:
-                    async with await connect_to_prisma() as prisma:
-                        response = await asyncio.wait_for(
-                            prisma.recv(),
-                            timeout=15,
-                        )
-                        prisma_data = json.loads(response)
-
-                        if prisma_data.get("type") == "connected":
-                            await websocket.send_json({
-                                "type": "prisma_connected",
-                                "message": (
-                                    "Gnani Prisma v3.0 is ready"
-                                ),
-                            })
-                        else:
-                            await websocket.send_json({
-                                "type": "session_error",
-                                "message": (
-                                    "Prisma did not confirm readiness"
-                                ),
-                            })
-
-                except Exception:
-                    logger.exception(
-                        "Prisma connection test failed"
-                    )
-                    await websocket.send_json({
-                        "type": "session_error",
-                        "message": (
-                            "Unable to connect to Prisma"
-                        ),
-                    })
-
-                continue
-
-            # --------------------------------------
             # INTERRUPT
             # --------------------------------------
+            # This acknowledges an interrupt request.
             # Actual cancellation of ongoing TTS
             # or model generation is not yet wired.
+
+            if event_type == "start_stt":
+                if prisma_ws is not None:
+                    await send_event({"type": "stt_connected"})
+                    continue
+                connection = None
+                try:
+                    connection = await connect_to_prisma()
+                    ready = json.loads(await asyncio.wait_for(connection.recv(), timeout=15))
+                    if ready.get("type") != "connected":
+                        raise RuntimeError("Prisma did not confirm readiness")
+                    prisma_ws = connection
+                    prisma_reader = asyncio.create_task(read_prisma(connection))
+                    await send_event({"type": "stt_connected"})
+                except Exception:
+                    logger.exception("Failed to start Prisma")
+                    if connection is not None:
+                        await connection.close()
+                    await send_event({"type": "session_error", "message": "Unable to start live transcription"})
+                continue
+
+            if event_type == "stop_stt":
+                if prisma_ws is not None:
+                    try:
+                        await prisma_ws.send(json.dumps({"type": "commit"}))
+                        await asyncio.sleep(1.5)
+                    except Exception:
+                        logger.exception("Prisma commit failed")
+                    if prisma_reader is not None:
+                        prisma_reader.cancel()
+                        await asyncio.gather(prisma_reader, return_exceptions=True)
+                        prisma_reader = None
+                    await prisma_ws.close()
+                    prisma_ws = None
+                await send_event({"type": "stt_stopped"})
+                continue
 
             if event_type == "interrupt":
                 await websocket.send_json({
@@ -429,14 +452,11 @@ async def voice_session(websocket: WebSocket):
                         ),
                     )
                 except Exception:
-                    logger.exception(
-                        "Danger alert persistence failed"
-                    )
+                    logger.exception("Danger alert persistence failed")
                     alert_persistence_failed = True
                     break
 
                 session.pending_alert_ids.add(alert_id)
-
                 await websocket.send_json({
                     "type": "danger_sign_detected",
                     "alert_id": alert_id,
@@ -452,6 +472,8 @@ async def voice_session(websocket: WebSocket):
                         "Visit processing was stopped; please retry."
                     ),
                 })
+                # Continue the OUTER WebSocket receive loop, not
+                # the inner danger-sign loop. No process_turn call.
                 continue
 
             # --------------------------------------
@@ -466,7 +488,12 @@ async def voice_session(websocket: WebSocket):
                 # Send the actual structured result.
                 await websocket.send_json(result)
 
-                # Avoid duplicate agent replies.
+                # ----------------------------------
+                # FIX: NO DUPLICATE AGENT REPLIES
+                # ----------------------------------
+                # If the session already returned
+                # agent_reply, do not send it again.
+
                 if result["type"] != "agent_reply":
                     reply_text = (
                         result.get("message")
@@ -502,6 +529,11 @@ async def voice_session(websocket: WebSocket):
         )
 
     finally:
+        if prisma_reader is not None:
+            prisma_reader.cancel()
+            await asyncio.gather(prisma_reader, return_exceptions=True)
+        if prisma_ws is not None:
+            await prisma_ws.close()
         logger.info(
             "Voice WebSocket session ended"
         )
