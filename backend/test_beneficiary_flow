@@ -1,0 +1,386 @@
+"""
+Beneficiary matching + visit save tests.
+
+Runs the REAL FastAPI app (WebSocket /ws/voice, /api/visits, SQLite) against a
+temporary database, so it never touches backend/sahayak.db.
+
+Only the Groq/Qwen call is stubbed (no API key / network needed). Each stubbed
+reply is the JSON shape Qwen returns from /api/extract, e.g. an ID spoken as
+"asha 103" or as a bare "102". Gnani STT is not involved: a transcript string
+is what the browser sends over the socket after STT.
+
+Run from backend/:   python -m pytest test_beneficiary_flow.py -v
+"""
+import os
+import re
+import sqlite3
+import tempfile
+from datetime import date
+from pathlib import Path
+
+_TMP = tempfile.mkdtemp(prefix="sahayak-test-")
+os.environ["SAHAYAK_DB_PATH"] = str(Path(_TMP) / "test.db")
+os.environ.setdefault("GROQ_API_KEY", "unused-in-tests")
+os.environ.setdefault("GROQ_MODEL", "unused-in-tests")
+
+import pytest  # noqa: E402
+from starlette.testclient import TestClient  # noqa: E402
+
+from app import database, main, session as session_module  # noqa: E402
+from app.schemas import VisitExtraction  # noqa: E402
+
+NEXT = date(2026, 11, 28)
+
+# transcript -> what Qwen would extract
+QWEN = {
+    "asha 103 Meena child visit weight 12.4 kg": dict(
+        beneficiary_id="asha 103", beneficiary_name="Meena",
+        visit_type="child", weight_kg=12.4),
+    "Meena child visit weight 11.9 kg": dict(
+        beneficiary_name="Meena", visit_type="child", weight_kg=11.9),
+    "Lakshmi newborn visit weight 2.8 kg": dict(
+        beneficiary_name="Lakshmi", visit_type="newborn", weight_kg=2.8),
+    "Lakshmi pregnancy visit": dict(
+        beneficiary_name="Lakshmi", visit_type="pregnancy"),
+    "Rampura": dict(),
+    "Hoskote": dict(),
+    "ASHA 102": dict(beneficiary_id="ASHA 102"),
+    "ASHA999 Lakshmi newborn visit weight 3 kg": dict(
+        beneficiary_id="ASHA999", beneficiary_name="Lakshmi",
+        visit_type="newborn", weight_kg=3.0),
+    "ASHA102 Meena newborn visit": dict(
+        beneficiary_id="ASHA102", beneficiary_name="Meena",
+        visit_type="newborn"),
+    "Priya newborn visit weight 3 kg": dict(
+        beneficiary_name="Priya", visit_type="newborn", weight_kg=3.0),
+    "ASHA777 newborn visit": dict(
+        beneficiary_id="ASHA777", visit_type="newborn"),
+    "ASHA105 Suma visit": dict(
+        beneficiary_id="ASHA105", beneficiary_name="Suma"),
+    "ASHA101 Anitha is pregnant and bleeding": dict(
+        beneficiary_id="ASHA101", beneficiary_name="Anitha",
+        visit_type="pregnancy"),
+    "Actually weight is 3.2 kg": dict(weight_kg=3.2),
+    # --- frontend demo scenarios (src/data/mock.ts), as Qwen might extract
+    "ಇವತ್ತು beneficiary 102 ಮನೆಗೆ ಹೋಗಿದ್ದೆ. ANC checkup ಆಗಿದೆ. TT injection due ಇದೆ. Next visit Monday.": dict(
+        beneficiary_id="102", visit_type="pregnancy",
+        vaccinations_due=["TT"], next_visit_date=NEXT),
+    "AS-102": dict(beneficiary_id="AS-102"),
+    "Beneficiary 205 newborn baby weight 2.8 kilo hai. Next visit tomorrow.": dict(
+        beneficiary_id="205", visit_type="newborn", weight_kg=2.8,
+        next_visit_date=NEXT),
+    "Pregnant woman ge bleeding agta ide.": dict(),
+    "Newborn baby ko high fever hai.": dict(visit_type="newborn"),
+    "No, weight is 2.8 kilo.": dict(weight_kg=2.8),
+    "Visited the newborn today. Baby is doing well.": dict(
+        visit_type="newborn"),
+    "ಇವತ್ತು ಮನೆಗೆ ಭೇಟಿ ಕೊಟ್ಟೆ. Maa ne bola baby ठीक है. Next visit Monday.": dict(
+        visit_type="newborn", next_visit_date=NEXT),
+}
+
+
+async def fake_extract(text):
+    return VisitExtraction(**QWEN[text])
+
+
+@pytest.fixture(autouse=True)
+def stub_qwen(monkeypatch):
+    monkeypatch.setattr(session_module, "extract_visit", fake_extract)
+
+    async def preview(text):
+        return VisitExtraction(**QWEN[text])
+    monkeypatch.setattr(main, "extract_visit", preview)
+
+
+@pytest.fixture(scope="module")
+def client():
+    with TestClient(main.app) as c:  # runs lifespan -> initialize_database
+        yield c
+
+
+def turn(ws, payload):
+    """Send one event, return every event up to the final agent_reply."""
+    ws.send_json(payload)
+    events = []
+    while True:
+        event = ws.receive_json()
+        events.append(event)
+        if event["type"] in {"agent_reply", "session_error"}:
+            return events
+
+
+def say(ws, text):
+    return turn(ws, {"type": "transcript_final", "text": text})
+
+
+def find(events, kind):
+    return next((e for e in events if e["type"] == kind), None)
+
+
+def visits(client):
+    return client.get("/api/visits").json()
+
+
+@pytest.fixture
+def ws(client):
+    with client.websocket_connect("/ws/voice") as socket:
+        assert socket.receive_json()["type"] == "session_connected"
+        yield socket
+
+
+# ---------------------------------------------------------------- database
+
+def test_active_db_is_the_temp_db_and_seed_is_exact(client):
+    assert str(database.DB_PATH) == os.environ["SAHAYAK_DB_PATH"]
+    rows = {b["beneficiary_id"]: b for b in client.get("/api/beneficiaries").json()}
+    expected = {
+        "ASHA101": ("Anitha", "Rampura"), "ASHA102": ("Lakshmi", "Rampura"),
+        "ASHA103": ("Meena", "Rampura"), "ASHA104": ("Lakshmi", "Hoskote"),
+        "ASHA105": ("Suma", "Hoskote"),
+    }
+    for bid, (name, village) in expected.items():
+        assert (rows[bid]["name"], rows[bid]["village"]) == (name, village)
+
+
+def test_seed_never_overwrites_existing_records():
+    with database.get_connection() as c:
+        c.execute("UPDATE beneficiaries SET village='Changed' WHERE beneficiary_id='ASHA105'")
+    database.initialize_database()
+    database.initialize_database()
+    row = next(b for b in database.list_beneficiaries() if b["beneficiary_id"] == "ASHA105")
+    assert row["village"] == "Changed"
+    with database.get_connection() as c:
+        c.execute("UPDATE beneficiaries SET village='Hoskote' WHERE beneficiary_id='ASHA105'")
+
+
+def test_frontend_demo_beneficiaries_exist_in_sqlite():
+    mock = (Path(__file__).resolve().parent.parent / "src/data/mock.ts").read_text()
+    demo = re.findall(r"\{id:'(AS-\d+)',name:'([^']+)'", mock)
+    assert len(demo) == 6
+    db = {b["beneficiary_id"]: b for b in database.list_beneficiaries()}
+    for bid, name in demo:
+        assert bid in db, f"demo beneficiary {bid} missing from SQLite"
+        assert db[bid]["name"] == name
+
+
+@pytest.mark.parametrize("raw", ["ASHA103", "asha103", " asha 103 ", "ASHA-103", "A S H A 1 0 3", "beneficiary asha103"])
+def test_id_normalization_matches_same_person(raw):
+    r = database.match_beneficiary(raw)
+    assert r["status"] == "matched" and r["matches"][0]["beneficiary_id"] == "ASHA103"
+
+
+def test_bare_digits_are_never_silently_promoted():
+    r = database.match_beneficiary("102")
+    assert r["status"] == "ambiguous"
+    assert {m["beneficiary_id"] for m in r["matches"]} == {"ASHA102", "AS-102"}
+
+
+# --------------------------------------------------------- websocket flows
+
+def test_meena_asha103_voice_to_sqlite_save(client, ws):
+    before = len(visits(client))
+    events = say(ws, "asha 103 Meena child visit weight 12.4 kg")
+    draft = find(events, "visit_draft")
+    assert draft["saved"] is False and draft["validated"] is True
+    assert draft["awaiting_confirmation"] is True
+    b = draft["beneficiary"]
+    assert (b["beneficiary_id"], b["name"], b["village"]) == ("ASHA103", "Meena", "Rampura")
+    assert len(visits(client)) == before            # draft is not a save
+
+    events = say(ws, "yes")
+    saved = find(events, "visit_saved")
+    assert saved and saved["beneficiary_id"] == "ASHA103"
+    row = next(v for v in visits(client) if v["id"] == saved["visit_id"])
+    assert row["beneficiary_id"] == "ASHA103" and row["weight_kg"] == 12.4
+    assert row["visit_type"] == "child"
+
+    # a second "yes" must not save again
+    assert not find(say(ws, "yes"), "visit_saved")
+    assert len(visits(client)) == before + 1
+
+
+def test_confirm_button_same_session_and_stale_revision(client, ws):
+    before = len(visits(client))
+    draft = find(say(ws, "Meena child visit weight 11.9 kg"), "visit_draft")
+    rev = draft["revision"]
+
+    stale = turn(ws, {"type": "confirm_visit", "revision": rev - 1})
+    assert not find(stale, "visit_saved") and "out of date" in stale[-1]["text"]
+    missing = turn(ws, {"type": "confirm_visit"})
+    assert not find(missing, "visit_saved")
+    assert len(visits(client)) == before
+
+    saved = find(turn(ws, {"type": "confirm_visit", "revision": rev}), "visit_saved")
+    assert saved and len(visits(client)) == before + 1
+    assert any(v["id"] == saved["visit_id"] for v in visits(client))
+
+
+def test_changed_draft_invalidates_old_confirm_revision(client, ws):
+    before = len(visits(client))
+    rev = find(say(ws, "Meena child visit weight 11.9 kg"), "visit_draft")["revision"]
+    new = find(say(ws, "Actually weight is 3.2 kg"), "visit_draft")
+    assert new["revision"] != rev
+    assert not find(turn(ws, {"type": "confirm_visit", "revision": rev}), "visit_saved")
+    assert len(visits(client)) == before
+    assert find(turn(ws, {"type": "confirm_visit", "revision": new["revision"]}), "visit_saved")
+
+
+def test_other_connection_cannot_confirm_this_draft(client, ws):
+    before = len(visits(client))
+    draft = find(say(ws, "Meena child visit weight 11.9 kg"), "visit_draft")
+    with client.websocket_connect("/ws/voice") as other:
+        other.receive_json()
+        assert not find(turn(other, {"type": "confirm_visit", "revision": draft["revision"]}), "visit_saved")
+        assert not find(say(other, "yes"), "visit_saved")
+    assert len(visits(client)) == before
+
+
+@pytest.mark.parametrize("answer,expected", [("Rampura", "ASHA102"), ("Hoskote", "ASHA104"), ("ASHA 102", "ASHA102")])
+def test_duplicate_lakshmi_clarifies_then_saves_chosen_one(client, ws, answer, expected):
+    before = len(visits(client))
+    events = say(ws, "Lakshmi newborn visit weight 2.8 kg")
+    clar = find(events, "beneficiary_clarification")
+    assert clar and clar["reason"] == "duplicate_name"
+    assert {c["beneficiary_id"] for c in clar["candidates"]} == {"ASHA102", "ASHA104"}
+    assert "Rampura" in clar["message"] and "Hoskote" in clar["message"]
+    assert not find(events, "visit_draft") and len(visits(client)) == before
+
+    # "yes" must not pick a candidate or save anything when there are two
+    assert not find(say(ws, "yes"), "visit_saved")
+
+    draft = find(say(ws, answer), "visit_draft")
+    assert draft["beneficiary"]["beneficiary_id"] == expected
+    saved = find(say(ws, "yes"), "visit_saved")
+    assert saved["beneficiary_id"] == expected
+    assert next(v for v in visits(client) if v["id"] == saved["visit_id"])["beneficiary_id"] == expected
+
+
+def test_invalid_id_with_name_returns_candidates_not_a_wrong_match(client, ws):
+    before = len(visits(client))
+    events = say(ws, "ASHA999 Lakshmi newborn visit weight 3 kg")
+    clar = find(events, "beneficiary_clarification")
+    assert clar["reason"] == "id_not_found"
+    assert "ASHA999" in clar["message"] and "was not found" in clar["message"]
+    assert {c["beneficiary_id"] for c in clar["candidates"]} == {"ASHA102", "ASHA104"}
+    assert not find(events, "visit_draft")
+    assert not find(say(ws, "yes"), "visit_saved")
+    assert len(visits(client)) == before
+
+
+def test_id_and_name_mismatch_is_flagged(client, ws):
+    events = say(ws, "ASHA102 Meena newborn visit")
+    clar = find(events, "beneficiary_clarification")
+    assert clar["reason"] == "id_name_mismatch"
+    assert "belongs to Lakshmi" in clar["message"] and "ASHA103" in clar["message"]
+    assert not find(events, "visit_draft")
+
+
+@pytest.mark.parametrize("text", ["Priya newborn visit weight 3 kg", "ASHA777 newborn visit"])
+def test_unknown_beneficiary_helpful_message_and_no_save(client, ws, text):
+    before = len(visits(client))
+    events = say(ws, text)
+    nf = find(events, "beneficiary_not_found")
+    assert nf and nf["saved"] is False and "Nothing has been saved" in nf["message"]
+    assert ("Priya" in nf["message"]) or ("ASHA777" in nf["message"])
+    assert "Beneficiary ID not found." != nf["message"]
+    assert not find(say(ws, "yes"), "visit_saved")
+    assert len(visits(client)) == before
+
+
+def test_incomplete_draft_cannot_be_confirmed(client, ws):
+    before = len(visits(client))
+    draft = find(say(ws, "ASHA105 Suma visit"), "visit_draft")    # no visit type
+    assert draft["validated"] is False and draft["awaiting_confirmation"] is False
+    assert not find(turn(ws, {"type": "confirm_visit", "revision": draft["revision"]}), "visit_saved")
+    assert not find(say(ws, "yes"), "visit_saved")
+    assert len(visits(client)) == before
+
+
+def test_danger_sign_blocks_save_until_acknowledged(client, ws):
+    before = len(visits(client))
+    events = say(ws, "ASHA101 Anitha is pregnant and bleeding")
+    alert = find(events, "danger_sign_detected")
+    draft = find(events, "visit_draft")
+    assert alert["requires_acknowledgement"] is True
+    assert draft["blocked_by_alert"] is True and draft["beneficiary"]["beneficiary_id"] == "ASHA101"
+
+    assert not find(say(ws, "yes"), "visit_saved")
+    blocked = turn(ws, {"type": "confirm_visit", "revision": draft["revision"]})
+    assert not find(blocked, "visit_saved") and "acknowledgement" in blocked[-1]["text"]
+    assert len(visits(client)) == before
+
+    ws.send_json({"type": "acknowledge_alert", "alert_id": alert["alert_id"]})
+    assert ws.receive_json()["acknowledged"] is True
+    saved = find(turn(ws, {"type": "confirm_visit", "revision": draft["revision"]}), "visit_saved")
+    assert saved and saved["beneficiary_id"] == "ASHA101"
+
+
+def test_switching_person_does_not_carry_over_old_fields(client, ws):
+    say(ws, "Lakshmi newborn visit weight 2.8 kg")
+    say(ws, "Hoskote")                                   # ASHA104, weight 2.8
+    draft = find(say(ws, "asha 103 Meena child visit weight 12.4 kg"), "visit_draft")
+    assert draft["beneficiary"]["beneficiary_id"] == "ASHA103"
+    assert draft["visit"]["weight_kg"] == 12.4
+
+
+# ------------------------------------------------------- frontend demo data
+
+def test_demo_pregnancy_scenario_bare_102_is_not_silently_lakshmi(client, ws):
+    before = len(visits(client))
+    text = "ಇವತ್ತು beneficiary 102 ಮನೆಗೆ ಹೋಗಿದ್ದೆ. ANC checkup ಆಗಿದೆ. TT injection due ಇದೆ. Next visit Monday."
+    clar = find(say(ws, text), "beneficiary_clarification")
+    assert {c["beneficiary_id"] for c in clar["candidates"]} == {"AS-102", "ASHA102"}
+    draft = find(say(ws, "AS-102"), "visit_draft")
+    assert draft["beneficiary"]["name"] == "Meena Kumari"
+    assert draft["visit"]["vaccinations_due"] == ["TT"]
+    saved = find(say(ws, "yes"), "visit_saved")
+    assert saved["beneficiary_id"] == "AS-102" and len(visits(client)) == before + 1
+
+
+def test_demo_newborn_scenario_single_candidate_needs_explicit_yes(client, ws):
+    before = len(visits(client))
+    clar = find(say(ws, "Beneficiary 205 newborn baby weight 2.8 kilo hai. Next visit tomorrow."),
+                "beneficiary_clarification")
+    assert [c["beneficiary_id"] for c in clar["candidates"]] == ["AS-205"]
+    assert len(visits(client)) == before             # suggestion alone saves nothing
+    draft = find(say(ws, "yes"), "visit_draft")      # yes = "that's the one"
+    assert draft["beneficiary"]["name"] == "Baby of Kavya" and draft["awaiting_confirmation"]
+    assert len(visits(client)) == before             # still not saved
+    assert find(say(ws, "yes"), "visit_saved")       # second, explicit yes
+    assert len(visits(client)) == before + 1
+
+
+@pytest.mark.parametrize("text", [
+    "Pregnant woman ge bleeding agta ide.",
+    "Newborn baby ko high fever hai.",
+])
+def test_demo_danger_scenarios_raise_alert_and_never_save(client, ws, text):
+    before = len(visits(client))
+    events = say(ws, text)
+    assert find(events, "danger_sign_detected")["requires_acknowledgement"] is True
+    assert not find(say(ws, "yes"), "visit_saved")
+    assert len(visits(client)) == before
+
+
+@pytest.mark.parametrize("text", [
+    "No, weight is 2.8 kilo.",
+    "Visited the newborn today. Baby is doing well.",
+    "ಇವತ್ತು ಮನೆಗೆ ಭೇಟಿ ಕೊಟ್ಟೆ. Maa ne bola baby ठीक है. Next visit Monday.",
+])
+def test_demo_scenarios_without_beneficiary_stay_unsaved(client, ws, text):
+    before = len(visits(client))
+    draft = find(say(ws, text), "visit_draft")
+    assert draft["validated"] is False and draft["beneficiary"] is None
+    assert not find(say(ws, "yes"), "visit_saved")
+    assert len(visits(client)) == before
+
+
+# ------------------------------------------------------------ REST preview
+
+def test_rest_extract_is_labelled_preview_only(client):
+    r = client.post("/api/extract", json={"text": "asha 103 Meena child visit weight 12.4 kg"})
+    body = r.json()
+    assert body["kind"] == "extraction_preview"
+    assert body["saved"] is False and body["validated"] is False
+    # raw Qwen output: the unmatched ID is passed through untouched
+    assert body["visit"]["beneficiary_id"] == "asha 103"
