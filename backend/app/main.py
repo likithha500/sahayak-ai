@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SAHAYAK AI API",
     description="Voice-first ASHA healthcare field assistant",
-    version="0.4.1",
+    version="0.4.2",
     lifespan=lifespan,
 )
 
@@ -80,7 +80,7 @@ async def health():
     return {
         "status": "ok",
         "service": "sahayak-ai",
-        "version": "0.4.1",
+        "version": "0.4.2",
     }
 
 
@@ -370,46 +370,43 @@ async def voice_session(websocket: WebSocket):
                 context,
             )
 
+            alert_persistence_failed = False
+
             for danger in danger_signs:
                 try:
                     alert_id = save_danger_alert(
                         danger["danger_type"],
                         transcript,
                         (
-                            session.beneficiary[
-                                "beneficiary_id"
-                            ]
+                            session.beneficiary["beneficiary_id"]
                             if session.beneficiary
                             else None
                         ),
                     )
-
-                    session.pending_alert_ids.add(
-                        alert_id
-                    )
-
-                    await websocket.send_json({
-                        "type": "danger_sign_detected",
-                        "alert_id": alert_id,
-                        **danger,
-                        "requires_acknowledgement": True,
-                    })
-
                 except Exception:
-                    logger.exception(
-                        "Danger alert persistence failed"
-                    )
+                    logger.exception("Danger alert persistence failed")
+                    alert_persistence_failed = True
+                    break
 
-                    await websocket.send_json({
-                        "type": "session_error",
-                        "message": (
-                            "Unable to persist urgent alert"
-                        ),
-                    })
+                session.pending_alert_ids.add(alert_id)
+                await websocket.send_json({
+                    "type": "danger_sign_detected",
+                    "alert_id": alert_id,
+                    **danger,
+                    "requires_acknowledgement": True,
+                })
 
-                    # Do not continue routine saving
-                    # when an urgent alert cannot be stored.
-                    continue
+            if alert_persistence_failed:
+                await websocket.send_json({
+                    "type": "session_error",
+                    "message": (
+                        "Urgent safety alert could not be recorded. "
+                        "Visit processing was stopped; please retry."
+                    ),
+                })
+                # Continue the OUTER WebSocket receive loop, not
+                # the inner danger-sign loop. No process_turn call.
+                continue
 
             # --------------------------------------
             # PROCESS MULTI-TURN CONVERSATION
