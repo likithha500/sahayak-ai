@@ -3,12 +3,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import (
-    FastAPI,
-    HTTPException,
-    WebSocket,
-    WebSocketDisconnect,
-)
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -27,29 +22,34 @@ from .schemas import ExtractRequest, ExtractResponse
 from .session import VisitSession
 from .safety import detect_danger_signs
 
+# Phase 3: Offline synchronization
+from .sync_api import router as offline_sync_router
+from .sync_db import init_sync_db
+
 
 logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------
+# ==================================================
 # DATABASE INITIALIZATION
-# --------------------------------------------------
+# ==================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     initialize_database()
+    init_sync_db()
     logger.info("SAHAYAK AI database initialized")
     yield
 
 
-# --------------------------------------------------
+# ==================================================
 # FASTAPI APPLICATION
-# --------------------------------------------------
+# ==================================================
 
 app = FastAPI(
     title="SAHAYAK AI API",
     description="Voice-first ASHA healthcare field assistant",
-    version="0.5.0",
+    version="0.6.0",
     lifespan=lifespan,
 )
 
@@ -64,54 +64,54 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Phase 3: Register offline synchronization endpoints
+app.include_router(offline_sync_router)
 
-# --------------------------------------------------
+
+# ==================================================
 # REQUEST SCHEMAS
-# --------------------------------------------------
+# ==================================================
 
 class ChatRequest(BaseModel):
     text: str = Field(min_length=1)
 
 
-# --------------------------------------------------
+# ==================================================
 # HEALTH CHECK
-# --------------------------------------------------
+# ==================================================
 
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
         "service": "sahayak-ai",
-        "version": "0.5.0",
+        "version": "0.6.0",
     }
 
 
-# --------------------------------------------------
+# ==================================================
 # GROQ / QWEN CHAT
-# --------------------------------------------------
+# ==================================================
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
     try:
         reply = await generate_reply(request.text)
-
         return {
             "reply": reply,
             "source": "groq-qwen",
         }
-
     except Exception:
         logger.exception("Groq/Qwen chat failed")
-
         raise HTTPException(
             status_code=502,
             detail="Unable to generate reply",
         )
 
 
-# --------------------------------------------------
+# ==================================================
 # STRUCTURED VISIT EXTRACTION
-# --------------------------------------------------
+# ==================================================
 
 @app.post(
     "/api/extract",
@@ -120,27 +120,24 @@ async def chat(request: ChatRequest):
 async def extract(request: ExtractRequest):
     try:
         visit = await extract_visit(request.text)
-
         return ExtractResponse(
             visit=visit,
             status="draft",
             saved=False,
         )
-
     except Exception:
         logger.exception("Visit extraction failed")
-
         raise HTTPException(
             status_code=502,
             detail="Unable to extract visit",
         )
 
 
-# --------------------------------------------------
+# ==================================================
 # DATABASE ENDPOINTS
-# Development only: authentication required
-# before using real beneficiary information.
-# --------------------------------------------------
+# Development only: authentication is required
+# before processing real beneficiary information.
+# ==================================================
 
 @app.get("/api/beneficiaries")
 async def beneficiaries():
@@ -157,15 +154,15 @@ async def alerts():
     return list_danger_alerts()
 
 
-# --------------------------------------------------
+# ==================================================
 # VOICE WEBSOCKET
-# --------------------------------------------------
+# ==================================================
 
 @app.websocket("/ws/voice")
 async def voice_session(websocket: WebSocket):
     await websocket.accept()
 
-    # Each WebSocket connection has its own visit draft.
+    # Each WebSocket connection gets its own visit session.
     session = VisitSession()
 
     logger.info("Voice WebSocket client connected")
@@ -180,7 +177,7 @@ async def voice_session(websocket: WebSocket):
             message = await websocket.receive()
 
             # --------------------------------------
-            # HANDLE DISCONNECTION
+            # DISCONNECTION
             # --------------------------------------
 
             if message["type"] == "websocket.disconnect":
@@ -189,8 +186,8 @@ async def voice_session(websocket: WebSocket):
             # --------------------------------------
             # BINARY AUDIO
             # --------------------------------------
-            # Gnani audio streaming integration
-            # will be connected separately.
+            # Gnani audio streaming will be
+            # connected separately.
 
             if message.get("bytes") is not None:
                 continue
@@ -201,16 +198,14 @@ async def voice_session(websocket: WebSocket):
                 continue
 
             # --------------------------------------
-            # PARSE WEBSOCKET JSON
+            # PARSE JSON
             # --------------------------------------
 
             try:
                 data = json.loads(raw)
 
                 if not isinstance(data, dict):
-                    raise ValueError(
-                        "Expected a JSON object"
-                    )
+                    raise ValueError("Expected a JSON object")
 
             except (json.JSONDecodeError, ValueError):
                 await websocket.send_json({
@@ -234,9 +229,9 @@ async def voice_session(websocket: WebSocket):
             # --------------------------------------
             # INTERRUPT
             # --------------------------------------
-            # This acknowledges an interrupt request.
-            # Actual cancellation of ongoing TTS
-            # or model generation is not yet wired.
+            # Acknowledges the interrupt request.
+            # Actual TTS/model cancellation is not
+            # yet implemented.
 
             if event_type == "interrupt":
                 await websocket.send_json({
@@ -251,22 +246,14 @@ async def voice_session(websocket: WebSocket):
             if event_type == "acknowledge_alert":
                 alert_id = data.get("alert_id")
 
-                if (
-                    type(alert_id) is not int
-                    or alert_id <= 0
-                ):
+                if type(alert_id) is not int or alert_id <= 0:
                     await websocket.send_json({
                         "type": "session_error",
-                        "message": (
-                            "A valid alert_id is required"
-                        ),
+                        "message": "A valid alert_id is required",
                     })
                     continue
 
-                if (
-                    alert_id
-                    not in session.pending_alert_ids
-                ):
+                if alert_id not in session.pending_alert_ids:
                     await websocket.send_json({
                         "type": "session_error",
                         "message": (
@@ -277,10 +264,8 @@ async def voice_session(websocket: WebSocket):
                     continue
 
                 try:
-                    acknowledged = (
-                        acknowledge_danger_alert(
-                            alert_id
-                        )
+                    acknowledged = acknowledge_danger_alert(
+                        alert_id
                     )
 
                     if acknowledged:
@@ -289,9 +274,7 @@ async def voice_session(websocket: WebSocket):
                         )
 
                     await websocket.send_json({
-                        "type": (
-                            "danger_alert_acknowledged"
-                        ),
+                        "type": "danger_alert_acknowledged",
                         "alert_id": alert_id,
                         "acknowledged": acknowledged,
                     })
@@ -303,46 +286,70 @@ async def voice_session(websocket: WebSocket):
 
                     await websocket.send_json({
                         "type": "session_error",
-                        "message": (
-                            "Unable to acknowledge alert"
-                        ),
+                        "message": "Unable to acknowledge alert",
                     })
 
                 continue
 
             # --------------------------------------
-            # REFERRAL STATUS (not an acknowledgement)
+            # UPDATE REFERRAL STATUS
             # --------------------------------------
+            # Referral status and alert
+            # acknowledgement are separate actions.
+
             if event_type == "update_referral_status":
                 alert_id = data.get("alert_id")
                 status = data.get("status")
-                if type(alert_id) is not int or alert_id <= 0 or status not in REFERRAL_STATUSES:
+
+                if (
+                    type(alert_id) is not int
+                    or alert_id <= 0
+                    or status not in REFERRAL_STATUSES
+                ):
                     await websocket.send_json({
                         "type": "session_error",
-                        "message": "Valid alert_id and referral status required",
+                        "message": (
+                            "Valid alert_id and referral "
+                            "status required"
+                        ),
                     })
                     continue
-                # Restrict changes to alerts raised in this active session.
+
                 if alert_id not in session.alert_ids:
                     await websocket.send_json({
                         "type": "session_error",
-                        "message": "Alert does not belong to this active session",
+                        "message": (
+                            "Alert does not belong "
+                            "to this active session"
+                        ),
                     })
                     continue
+
                 try:
-                    updated = update_referral_status(alert_id, status)
+                    updated = update_referral_status(
+                        alert_id,
+                        status,
+                    )
+
                     await websocket.send_json({
                         "type": "referral_status_updated",
                         "alert_id": alert_id,
                         "status": status,
                         "updated": updated,
                     })
+
                 except Exception:
-                    logger.exception("Referral status update failed")
+                    logger.exception(
+                        "Referral status update failed"
+                    )
+
                     await websocket.send_json({
                         "type": "session_error",
-                        "message": "Unable to update referral status",
+                        "message": (
+                            "Unable to update referral status"
+                        ),
                     })
+
                 continue
 
             # --------------------------------------
@@ -356,8 +363,7 @@ async def voice_session(websocket: WebSocket):
                 await websocket.send_json({
                     "type": "session_error",
                     "message": (
-                        f"Unsupported event: "
-                        f"{event_type}"
+                        f"Unsupported event: {event_type}"
                     ),
                 })
                 continue
@@ -370,9 +376,7 @@ async def voice_session(websocket: WebSocket):
             ):
                 await websocket.send_json({
                     "type": "session_error",
-                    "message": (
-                        "Transcript cannot be empty"
-                    ),
+                    "message": "Transcript cannot be empty",
                 })
                 continue
 
@@ -389,9 +393,9 @@ async def voice_session(websocket: WebSocket):
                 })
 
             # --------------------------------------
-            # INDEPENDENT DANGER-SIGN CHECK
+            # INDEPENDENT SAFETY DETECTION
             # --------------------------------------
-            # Safety detection runs BEFORE Qwen.
+            # Safety rules run BEFORE Qwen.
 
             context = (
                 session.draft.visit_type
@@ -421,17 +425,27 @@ async def voice_session(websocket: WebSocket):
                         ),
                         severity=danger["severity"],
                         matched_sign=danger["matched_sign"],
-                        guideline_document=danger["guideline_document"],
-                        guideline_page=danger["guideline_page"],
-                        recommended_action=danger["recommended_action"],
+                        guideline_document=danger[
+                            "guideline_document"
+                        ],
+                        guideline_page=danger[
+                            "guideline_page"
+                        ],
+                        recommended_action=danger[
+                            "recommended_action"
+                        ],
                     )
+
                 except Exception:
-                    logger.exception("Danger alert persistence failed")
+                    logger.exception(
+                        "Danger alert persistence failed"
+                    )
                     alert_persistence_failed = True
                     break
 
                 session.pending_alert_ids.add(alert_id)
                 session.alert_ids.add(alert_id)
+
                 await websocket.send_json({
                     "type": "danger_sign_detected",
                     "alert_id": alert_id,
@@ -439,16 +453,18 @@ async def voice_session(websocket: WebSocket):
                     "requires_acknowledgement": True,
                 })
 
+            # Stop processing if an urgent alert
+            # could not be saved to the database.
+
             if alert_persistence_failed:
                 await websocket.send_json({
                     "type": "session_error",
                     "message": (
-                        "Urgent safety alert could not be recorded. "
-                        "Visit processing was stopped; please retry."
+                        "Urgent safety alert could not "
+                        "be recorded. Visit processing "
+                        "was stopped; please retry."
                     ),
                 })
-                # Continue the OUTER WebSocket receive loop, not
-                # the inner danger-sign loop. No process_turn call.
                 continue
 
             # --------------------------------------
@@ -460,15 +476,9 @@ async def voice_session(websocket: WebSocket):
                     transcript
                 )
 
-                # Send the actual structured result.
                 await websocket.send_json(result)
 
-                # ----------------------------------
-                # FIX: NO DUPLICATE AGENT REPLIES
-                # ----------------------------------
-                # If the session already returned
-                # agent_reply, do not send it again.
-
+                # Avoid sending duplicate agent replies.
                 if result["type"] != "agent_reply":
                     reply_text = (
                         result.get("message")
@@ -488,9 +498,7 @@ async def voice_session(websocket: WebSocket):
 
                 await websocket.send_json({
                     "type": "session_error",
-                    "message": (
-                        "Unable to process visit"
-                    ),
+                    "message": "Unable to process visit",
                 })
 
     except WebSocketDisconnect:
