@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import sqlite3
 from contextlib import asynccontextmanager
 
 from fastapi import (
@@ -15,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from .database import (
     initialize_database,
+    get_beneficiary, register_beneficiary, save_visit,
     list_beneficiaries,
     list_visits,
     list_danger_alerts,
@@ -22,7 +24,7 @@ from .database import (
     acknowledge_danger_alert,
 )
 from .groq_llm import generate_reply, extract_visit
-from .schemas import ExtractRequest, ExtractResponse
+from .schemas import ExtractRequest, ExtractResponse, VisitExtraction
 from .session import VisitSession
 from .safety import detect_danger_signs
 from .gnani_stt import connect_to_prisma
@@ -155,6 +157,62 @@ async def visits():
 @app.get("/api/alerts")
 async def alerts():
     return list_danger_alerts()
+
+
+# REST workflow independent of the voice WebSocket session.
+class BeneficiaryRegistration(BaseModel):
+    beneficiary_id: str = Field(min_length=2, max_length=40)
+    name: str = Field(min_length=1, max_length=120)
+    category: str = Field(min_length=1, max_length=40)
+    village: str = Field(min_length=1, max_length=120)
+
+
+class SaveVisitRequest(BaseModel):
+    beneficiary_id: str = Field(min_length=2)
+    visit: VisitExtraction
+    transcript: str = Field(min_length=1)
+    acknowledge_danger: bool = False
+
+
+@app.get("/api/beneficiaries/{beneficiary_id}")
+async def beneficiary_by_id(beneficiary_id: str):
+    match = get_beneficiary(beneficiary_id)
+    if not match:
+        raise HTTPException(status_code=404, detail="Beneficiary not found. Register this ID first.")
+    return match
+
+
+@app.post("/api/beneficiaries/register", status_code=201)
+async def create_beneficiary(request: BeneficiaryRegistration):
+    beneficiary_id = request.beneficiary_id.strip().upper()
+    if get_beneficiary(beneficiary_id):
+        raise HTTPException(status_code=409, detail="Beneficiary ID already exists")
+    try:
+        return register_beneficiary(beneficiary_id, request.name.strip(), request.category.strip(), request.village.strip())
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Beneficiary ID already exists")
+
+
+@app.post("/api/visits/confirm", status_code=201)
+async def confirm_visit(request: SaveVisitRequest):
+    beneficiary = get_beneficiary(request.beneficiary_id)
+    if not beneficiary:
+        raise HTTPException(status_code=404, detail="Beneficiary ID not found")
+    if not request.visit.visit_type:
+        raise HTTPException(status_code=422, detail="Visit type is required")
+    alerts = detect_danger_signs(request.transcript, request.visit.visit_type)
+    if alerts and not request.acknowledge_danger:
+        raise HTTPException(status_code=409, detail="Urgent referral alert must be acknowledged before saving")
+    try:
+        visit_id = save_visit(beneficiary["beneficiary_id"], request.visit)
+        for alert in alerts:
+            alert_id = save_danger_alert(alert["danger_type"], request.transcript, beneficiary["beneficiary_id"])
+            if request.acknowledge_danger:
+                acknowledge_danger_alert(alert_id)
+    except Exception:
+        logger.exception("Saving visit failed")
+        raise HTTPException(status_code=500, detail="Unable to save visit")
+    return {"saved": True, "visit_id": visit_id, "beneficiary_id": beneficiary["beneficiary_id"], "alerts": alerts}
 
 
 # --------------------------------------------------

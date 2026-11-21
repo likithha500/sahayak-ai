@@ -49,19 +49,6 @@ def initialize_database():
             )
         """)
 
-        samples = [
-            ("ASHA101", "Anitha", "pregnancy", "Rampura"),
-            ("ASHA102", "Lakshmi", "newborn", "Rampura"),
-            ("ASHA103", "Meena", "child", "Rampura"),
-            ("ASHA104", "Lakshmi", "pregnancy", "Hoskote"),
-            ("ASHA105", "Suma", "postnatal", "Hoskote"),
-        ]
-
-        connection.executemany("""
-            INSERT OR IGNORE INTO beneficiaries
-            (beneficiary_id, name, category, village)
-            VALUES (?, ?, ?, ?)
-        """, samples)
 
 
 def list_beneficiaries():
@@ -215,3 +202,20 @@ def list_danger_alerts():
             ORDER BY id DESC
         """).fetchall()
         return [dict(row) for row in rows]
+
+
+def get_beneficiary(beneficiary_id):
+    normalized = "".join(ch for ch in beneficiary_id.upper() if ch.isalnum())
+    with get_connection() as connection:
+        rows = connection.execute("SELECT * FROM beneficiaries").fetchall()
+        for row in rows:
+            if "".join(ch for ch in row["beneficiary_id"].upper() if ch.isalnum()) == normalized:
+                return dict(row)
+    return None
+
+
+def register_beneficiary(beneficiary_id, name, category, village):
+    with get_connection() as connection:
+        connection.execute("INSERT INTO beneficiaries (beneficiary_id,name,category,village) VALUES (?,?,?,?)",
+                           (beneficiary_id, name, category, village))
+    return get_beneficiary(beneficiary_id)
