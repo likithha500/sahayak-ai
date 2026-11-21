@@ -4,7 +4,6 @@
 
 SAHAYAK AI is an AI-assisted field companion designed around the workflows of **Accredited Social Health Activists (ASHAs)** in India. It combines multilingual speech recognition, structured visit documentation, beneficiary history, and guideline-informed danger-sign alerts to make home-visit records easier to capture and review.
 
-> **Data policy:** SAHAYAK AI must be demonstrated and tested with **synthetic beneficiaries and fictional visits only**. Do not enter real patient names, identifiers, clinical records, or recordings. The application supports documentation and referral awareness; it does not diagnose, prescribe, or replace clinical judgment.
 
 ## The problem
 
